@@ -1,0 +1,68 @@
+/* Raven Glass, light. Applied on top of raven-glass.css when the desktop's
+   theme mode is light: the same material seen against a bright ground.
+   Keep the three copies of this file identical. */
+@define-color window_bg_color #f2f2f7;
+@define-color window_fg_color #1c1c22;
+@define-color headerbar_bg_color #f2f2f7;
+@define-color headerbar_fg_color #1c1c22;
+@define-color headerbar_border_color alpha(#000000, 0.08);
+@define-color view_bg_color #ffffff;
+@define-color view_fg_color #1c1c22;
+@define-color card_bg_color alpha(#ffffff, 0.70);
+@define-color card_fg_color #1c1c22;
+@define-color card_shade_color alpha(#000000, 0.07);
+@define-color dialog_bg_color #f7f7fa;
+@define-color dialog_fg_color #1c1c22;
+@define-color popover_bg_color #ffffff;
+@define-color popover_fg_color #1c1c22;
+@define-color popover_shade_color alpha(#000000, 0.12);
+@define-color sidebar_bg_color #e9e9ef;
+@define-color sidebar_fg_color #1c1c22;
+@define-color sidebar_border_color alpha(#000000, 0.08);
+@define-color sidebar_backdrop_color #e9e9ef;
+@define-color borders alpha(#000000, 0.09);
+@define-color shade_color alpha(#000000, 0.10);
+
+window.raven.glass { background-color: alpha(#f2f2f7, 0.88); }
+window.raven.glass .sidebar { background-color: alpha(#ffffff, 0.30); }
+headerbar { border-bottom-color: alpha(#000000, 0.07); }
+.sidebar { border-right-color: alpha(#000000, 0.07); }
+.sidebar list.navigation-sidebar row:hover { background-color: alpha(#000000, 0.05); }
+.sidebar list.navigation-sidebar row:active { background-color: alpha(#000000, 0.08); }
+.sidebar entry.search, .sidebar .sidebar-search entry {
+  background-color: alpha(#ffffff, 0.75); border-color: alpha(#000000, 0.08);
+}
+.sidebar separator { background-color: alpha(#000000, 0.08); }
+.card, .raven-card, .app-card, .category-tile, .metric-card, .profile-card {
+  background-color: alpha(#ffffff, 0.72);
+  border-color: alpha(#000000, 0.07);
+  box-shadow: 0 1px 2px alpha(#000000, 0.05);
+}
+button.status-card:hover { background-color: alpha(#ffffff, 0.95); }
+list.boxed-list { background-color: alpha(#ffffff, 0.72); border-color: alpha(#000000, 0.07); box-shadow: 0 1px 2px alpha(#000000, 0.05); }
+list.boxed-list > row { border-bottom-color: alpha(#000000, 0.07); }
+list.boxed-list > row:hover { background-color: alpha(#000000, 0.03); }
+list.boxed-list > row.activatable:active { background-color: alpha(#000000, 0.06); }
+.data-row { border-bottom-color: alpha(#000000, 0.07); }
+button { background-color: alpha(#ffffff, 0.85); border-color: alpha(#000000, 0.10); box-shadow: 0 1px 1px alpha(#000000, 0.06); }
+button:hover { background-color: #ffffff; }
+button:active, button:checked { background-color: alpha(#000000, 0.08); box-shadow: inset 0 1px 2px alpha(#000000, 0.12); }
+button.flat { background-color: transparent; border-color: transparent; box-shadow: none; }
+button.flat:hover { background-color: alpha(#000000, 0.06); }
+button.flat:active, button.flat:checked { background-color: alpha(#000000, 0.10); }
+entry, .search-box, spinbutton, dropdown > button, combobox > box > button {
+  background-color: alpha(#ffffff, 0.85); border-color: alpha(#000000, 0.10);
+}
+popover > arrow, popover > contents { border-color: alpha(#000000, 0.10); box-shadow: 0 12px 32px alpha(#000000, 0.18); }
+switch { background-color: alpha(#000000, 0.16); }
+scale trough { background-color: alpha(#000000, 0.14); }
+levelbar block, progressbar trough { background-color: alpha(#000000, 0.10); }
+checkbutton check, checkbutton radio { border-color: alpha(#000000, 0.25); background-color: #ffffff; }
+.badge.neutral, .badge.origin { background-color: alpha(#000000, 0.07); color: alpha(@window_fg_color, 0.75); }
+.kbd { border-color: alpha(#000000, 0.16); background-color: alpha(#000000, 0.03); }
+toast { background-color: alpha(#ffffff, 0.96); border-color: alpha(#000000, 0.10); box-shadow: 0 10px 30px alpha(#000000, 0.18); }
+tooltip { background-color: alpha(#ffffff, 0.97); border-color: alpha(#000000, 0.10); }
+scrollbar slider { background-color: alpha(#000000, 0.22); }
+scrollbar slider:hover { background-color: alpha(#000000, 0.36); }
+separator.horizontal, separator.vertical { background-color: alpha(#000000, 0.08); }
+.nav-icon.black { background-color: #3a3a40; }

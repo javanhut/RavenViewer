@@ -1,0 +1,4 @@
+# lld links several times faster than GNU ld, which is most of an
+# incremental rebuild's wall time.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

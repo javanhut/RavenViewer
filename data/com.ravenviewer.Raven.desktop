@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Raven Viewer
+GenericName=Document Viewer
+Comment=Read PDF and DOCX files — outline, annotations, search
+Exec=raven-viewer %U
+Icon=com.ravenviewer.Raven
+Terminal=false
+Type=Application
+Categories=Office;Viewer;GTK;
+Keywords=PDF;DOCX;Document;Reader;Viewer;Book;
+MimeType=application/pdf;application/x-pdf;application/vnd.openxmlformats-officedocument.wordprocessingml.document;
+StartupNotify=true
+StartupWMClass=raven-viewer
+DBusActivatable=false

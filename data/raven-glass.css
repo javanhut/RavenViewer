@@ -1,0 +1,417 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   Raven Glass — the one look shared by Raven Settings, Raven Store and
+   Raven Power. Keep the three copies of this file identical; each app
+   appends its own classes after it.
+
+   The language, in five rules:
+     1. One material. Surfaces are translucent layers of the same dark
+        glass; hierarchy comes from how much light a layer lets through,
+        not from a different colour per app.
+     2. A hairline, never a heavy border. 1px of white at ~8% alpha, and a
+        brighter 1px catch-light along the top edge of a raised surface.
+     3. One radius scale: 6 controls · 8 rows · 12 groups · 14 cards ·
+        20 heroes. Nothing else.
+     4. Type earns hierarchy with weight and tracking, not with size alone:
+        page titles are heavy and tight, secondary text is the same face at
+        55% opacity.
+     5. The accent is the person's, and it does exactly two jobs — the
+        selected item, and the primary action. Everything else is grey.
+   ───────────────────────────────────────────────────────────────────────── */
+
+@define-color accent_bg_color #7AA2F7;
+@define-color accent_color #7AA2F7;
+@define-color accent_fg_color #ffffff;
+
+@define-color window_bg_color #17171d;
+@define-color window_fg_color #e8e8f0;
+@define-color headerbar_bg_color #17171d;
+@define-color headerbar_fg_color #e8e8f0;
+@define-color headerbar_border_color alpha(#ffffff, 0.08);
+@define-color headerbar_shade_color rgba(0,0,0,0);
+@define-color headerbar_darker_shade_color rgba(0,0,0,0);
+@define-color view_bg_color #1c1c23;
+@define-color view_fg_color #e8e8f0;
+@define-color card_bg_color alpha(#ffffff, 0.06);
+@define-color card_fg_color #e8e8f0;
+@define-color card_shade_color alpha(#ffffff, 0.08);
+@define-color dialog_bg_color #202028;
+@define-color dialog_fg_color #e8e8f0;
+@define-color popover_bg_color #26262f;
+@define-color popover_fg_color #e8e8f0;
+@define-color popover_shade_color alpha(#000000, 0.30);
+@define-color sidebar_bg_color #121218;
+@define-color sidebar_fg_color #e8e8f0;
+@define-color sidebar_border_color alpha(#ffffff, 0.08);
+@define-color sidebar_backdrop_color #121218;
+@define-color borders alpha(#ffffff, 0.09);
+@define-color shade_color alpha(#000000, 0.36);
+@define-color success_color #34d399;
+@define-color warning_color #fbbf24;
+@define-color error_color #fb7185;
+@define-color destructive_bg_color #e5484d;
+@define-color destructive_color #fb7185;
+
+/* ── Window ──────────────────────────────────────────────────────────── */
+window.raven { background-color: @window_bg_color; color: @window_fg_color; }
+
+/* ── Type ────────────────────────────────────────────────────────────── */
+/* Secondary text is ONE mechanism: the foreground at 70% alpha. Adwaita
+   also dims `row label.subtitle`, `.dim-label`, header subtitles and
+   placeholders with `opacity: 55%`; left in place that stacks with our
+   colour alpha and the text lands near 30%, unreadable over the glass.
+   So every dimmed thing gets opacity 1 here and the colour does the work.
+   Small text (≤13px) gets a hair of positive tracking so it stays open. */
+window.raven row label.subtitle, window.raven .dim-label, window.raven .dimmed,
+window.raven headerbar .subtitle, window.raven windowtitle .subtitle,
+window.raven entry > text > placeholder, window.raven spinbutton > text > placeholder,
+window.raven label.separator {
+  opacity: 1;
+}
+window.raven row label.title { opacity: 1; }
+toolbarview, stack, .page-scroll > viewport, scrolledwindow > viewport { background-color: transparent; }
+window.raven.csd { border-radius: 14px; }
+
+/* The glass window: alpha only. The blur behind it is the compositor's to
+   draw. Toggled by "Window transparency" via the .glass class. */
+window.raven.glass { background-color: alpha(#15151b, 0.85); }
+window.raven.glass .sidebar { background-color: alpha(#0b0b10, 0.40); }
+
+/* ── Header bar: a thin translucent strip, no shadow, no heavy rule. ──── */
+headerbar {
+  min-height: 46px;
+  padding: 0 8px;
+  background-color: transparent;
+  box-shadow: none;
+  border-bottom: 1px solid alpha(#ffffff, 0.07);
+}
+headerbar .title { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }
+headerbar .subtitle { font-size: 13px; color: alpha(@window_fg_color, 0.70); }
+headerbar windowtitle .title { font-weight: 600; }
+headerbar button { min-height: 28px; min-width: 28px; border-radius: 8px; padding: 0 6px; }
+windowcontrols button { min-height: 22px; min-width: 22px; padding: 0; }
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+.sidebar {
+  background-color: @sidebar_bg_color;
+  border-right: 1px solid alpha(#ffffff, 0.07);
+  padding: 14px 12px 14px 12px;
+}
+.sidebar-pane { background-color: transparent; }
+.sidebar .brand { margin: 2px 8px 10px 8px; }
+.sidebar .brand image { color: @accent_bg_color; -gtk-icon-size: 30px; }
+.sidebar .app-title { font-size: 21px; font-weight: 700; letter-spacing: -0.4px; }
+.sidebar .app-subtitle { font-size: 13px; color: alpha(@window_fg_color, 0.70); }
+.sidebar .sidebar-search {
+  margin: 0 2px 12px 2px;
+}
+.sidebar .sidebar-search entry,
+.sidebar .sidebar-search searchbar entry,
+.sidebar entry.search {
+  min-height: 30px;
+  border-radius: 8px;
+  background-color: alpha(#ffffff, 0.07);
+  border: 1px solid alpha(#ffffff, 0.06);
+  box-shadow: none;
+  color: @window_fg_color;
+}
+.sidebar entry.search:focus-within { border-color: alpha(@accent_bg_color, 0.65); box-shadow: 0 0 0 3px alpha(@accent_bg_color, 0.20); }
+.sidebar entry.search image { color: alpha(@window_fg_color, 0.60); -gtk-icon-size: 14px; }
+.sidebar list.navigation-sidebar { background: transparent; padding: 0; }
+.sidebar list.navigation-sidebar row {
+  border-radius: 8px;
+  padding: 5px 8px;
+  margin: 1px 0;
+  min-height: 30px;
+  transition: background-color 120ms ease-out;
+}
+.sidebar list.navigation-sidebar row:hover { background-color: alpha(#ffffff, 0.06); }
+.sidebar list.navigation-sidebar row:active { background-color: alpha(#ffffff, 0.10); }
+.sidebar list.navigation-sidebar row:selected {
+  background-color: @accent_bg_color;
+  color: #ffffff;
+  box-shadow: none;
+}
+.sidebar list.navigation-sidebar row:selected label { color: #ffffff; font-weight: 500; }
+.sidebar list.navigation-sidebar row:selected .badge { background-color: alpha(#ffffff, 0.22); color: #ffffff; }
+.sidebar list.navigation-sidebar row label { font-size: 14px; }
+.sidebar separator { margin: 8px 6px; background-color: alpha(#ffffff, 0.08); }
+
+/* The tinted icon tile beside each section — a coloured rounded square
+   with a white symbolic glyph in it. The tint names the section's domain
+   and never the accent, so the sidebar stays legible under any accent. */
+.nav-icon {
+  min-width: 24px; min-height: 24px;
+  border-radius: 6px;
+  background-color: #8e8e93;
+  box-shadow: inset 0 1px 0 alpha(#ffffff, 0.18), 0 1px 1px alpha(#000000, 0.18);
+}
+.nav-icon image { color: #ffffff; -gtk-icon-size: 14px; }
+.nav-icon.blue      { background-color: #3478f6; }
+.nav-icon.indigo    { background-color: #5e5ce6; }
+.nav-icon.purple    { background-color: #af52de; }
+.nav-icon.pink      { background-color: #ff375f; }
+.nav-icon.red       { background-color: #ff453a; }
+.nav-icon.orange    { background-color: #ff9f0a; }
+.nav-icon.yellow    { background-color: #ffcc00; }
+.nav-icon.green     { background-color: #30d158; }
+.nav-icon.teal      { background-color: #40c8e0; }
+.nav-icon.cyan      { background-color: #5ac8fa; }
+.nav-icon.gray      { background-color: #8e8e93; }
+.nav-icon.graphite  { background-color: #5c5c62; }
+.nav-icon.black     { background-color: #2c2c30; }
+
+/* ── Surfaces: cards, groups, wells ──────────────────────────────────── */
+.card, .raven-card, .app-card, .category-tile, .metric-card, .profile-card {
+  background-color: alpha(#ffffff, 0.055);
+  border: 1px solid alpha(#ffffff, 0.08);
+  box-shadow: inset 0 1px 0 alpha(#ffffff, 0.06);
+  border-radius: 14px;
+  padding: 16px;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out;
+}
+.raven-card .card-title, .card-title { font-weight: 600; font-size: 15px; letter-spacing: -0.1px; }
+.raven-card .card-subtitle, .card-subtitle, .page-subtitle, .dim, .dim-label, .dimmed {
+  color: alpha(@window_fg_color, 0.70);
+}
+.raven-card .card-subtitle, .card-subtitle { font-size: 13px; }
+.status-card { padding: 10px 12px; border-radius: 12px; }
+button.status-card { padding: 10px 12px; }
+button.status-card:hover { background-color: alpha(#ffffff, 0.09); }
+.status-card image { color: @accent_bg_color; }
+.user-card .name, .name { font-weight: 600; }
+.section-title { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }
+.page-title { font-size: 26px; font-weight: 700; letter-spacing: -0.6px; color: @window_fg_color; }
+.page-subtitle { font-size: 14px; }
+.eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 0.6px; color: alpha(@window_fg_color, 0.70); }
+.note { color: alpha(@window_fg_color, 0.70); font-size: 13px; letter-spacing: 0.1px; }
+.mono { font-family: monospace; font-size: 13px; }
+.property { font-size: 13px; }
+
+/* Inset grouped list — the macOS settings list. Rows are flat, a hairline
+   between them, the group itself a rounded well. */
+list.boxed-list {
+  background-color: alpha(#ffffff, 0.055);
+  border: 1px solid alpha(#ffffff, 0.08);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 alpha(#ffffff, 0.05);
+}
+list.boxed-list > row {
+  background-color: transparent;
+  border-bottom: 1px solid alpha(#ffffff, 0.07);
+  min-height: 44px;
+  padding: 2px 4px;
+  transition: background-color 100ms ease-out;
+}
+list.boxed-list > row:first-child { border-top-left-radius: 12px; border-top-right-radius: 12px; }
+list.boxed-list > row:last-child { border-bottom: none; border-bottom-left-radius: 12px; border-bottom-right-radius: 12px; }
+list.boxed-list > row:hover { background-color: alpha(#ffffff, 0.035); }
+list.boxed-list > row.activatable:active { background-color: alpha(#ffffff, 0.08); }
+list.boxed-list > row .title { font-size: 14px; font-weight: 500; }
+list.boxed-list > row .subtitle { font-size: 13px; letter-spacing: 0.1px; color: alpha(@window_fg_color, 0.70); }
+row.expander list { background-color: transparent; }
+.data-row { padding: 12px 2px; border-bottom: 1px solid alpha(#ffffff, 0.07); }
+.data-row:last-child { border-bottom: none; }
+
+/* ── Controls ────────────────────────────────────────────────────────── */
+button {
+  border-radius: 8px;
+  min-height: 30px;
+  padding: 0 12px;
+  background-color: alpha(#ffffff, 0.08);
+  border: 1px solid alpha(#ffffff, 0.06);
+  box-shadow: inset 0 1px 0 alpha(#ffffff, 0.06);
+  color: @window_fg_color;
+  font-weight: 500;
+  transition: background-color 90ms ease-out, box-shadow 90ms ease-out;
+}
+button:hover { background-color: alpha(#ffffff, 0.12); }
+button:active, button:checked { background-color: alpha(#ffffff, 0.16); box-shadow: inset 0 1px 2px alpha(#000000, 0.25); }
+button:disabled { opacity: 0.45; }
+button.flat, headerbar button.flat { background-color: transparent; border-color: transparent; box-shadow: none; }
+button.flat:hover { background-color: alpha(#ffffff, 0.08); }
+button.flat:active, button.flat:checked { background-color: alpha(#ffffff, 0.12); }
+button.suggested-action, button.circular.accent {
+  background-color: @accent_bg_color;
+  color: #ffffff;
+  border-color: alpha(#000000, 0.12);
+  box-shadow: inset 0 1px 0 alpha(#ffffff, 0.18);
+}
+button.suggested-action:hover { background-image: linear-gradient(alpha(#ffffff, 0.10), alpha(#ffffff, 0.10)); }
+button.suggested-action:active { background-image: linear-gradient(alpha(#000000, 0.12), alpha(#000000, 0.12)); }
+button.destructive-action { background-color: @destructive_bg_color; color: #ffffff; border-color: alpha(#000000, 0.12); }
+button.pill { border-radius: 999px; padding: 0 16px; }
+button.circular { border-radius: 999px; padding: 0; min-width: 30px; }
+button.accent { color: @accent_bg_color; }
+button.text-button { padding: 0 14px; }
+
+.segmented, .linked { border-radius: 8px; }
+.segmented button { min-width: 70px; border-radius: 0; }
+.segmented button:first-child { border-top-left-radius: 8px; border-bottom-left-radius: 8px; }
+.segmented button:last-child { border-top-right-radius: 8px; border-bottom-right-radius: 8px; }
+.segmented button:checked {
+  background-color: @accent_bg_color;
+  color: #ffffff;
+  box-shadow: inset 0 1px 0 alpha(#ffffff, 0.18);
+}
+
+entry, .search-box, spinbutton, dropdown > button, combobox > box > button {
+  border-radius: 8px;
+  min-height: 30px;
+  background-color: alpha(#ffffff, 0.07);
+  border: 1px solid alpha(#ffffff, 0.07);
+  box-shadow: none;
+  color: @window_fg_color;
+  transition: border-color 120ms ease-out, box-shadow 120ms ease-out;
+}
+entry:focus-within, .search-box:focus-within {
+  border-color: alpha(@accent_bg_color, 0.65);
+  box-shadow: 0 0 0 3px alpha(@accent_bg_color, 0.20);
+}
+entry image { color: alpha(@window_fg_color, 0.60); }
+entry placeholder, entry > placeholder, entry text > placeholder { color: alpha(@window_fg_color, 0.48); }
+dropdown > button { padding: 0 8px 0 12px; }
+popover > arrow, popover > contents {
+  background-color: @popover_bg_color;
+  border: 1px solid alpha(#ffffff, 0.10);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px alpha(#000000, 0.45), inset 0 1px 0 alpha(#ffffff, 0.06);
+}
+popover listview > row, popover list > row { border-radius: 8px; padding: 6px 10px; }
+popover listview > row:selected, popover list > row:selected { background-color: @accent_bg_color; color: #ffffff; }
+
+switch {
+  min-height: 22px; min-width: 38px;
+  border-radius: 999px;
+  background-color: alpha(#ffffff, 0.14);
+  border: none;
+  box-shadow: inset 0 1px 2px alpha(#000000, 0.30);
+  transition: background-color 160ms ease-out;
+}
+switch slider {
+  min-height: 18px; min-width: 18px;
+  margin: 2px;
+  border-radius: 999px;
+  background-color: #ffffff;
+  border: none;
+  box-shadow: 0 1px 3px alpha(#000000, 0.45);
+}
+switch:checked { background-color: @accent_bg_color; }
+switch:checked slider { background-color: #ffffff; }
+switch:disabled { opacity: 0.45; }
+
+scale { min-height: 20px; }
+scale trough { min-height: 5px; border-radius: 999px; background-color: alpha(#ffffff, 0.14); border: none; box-shadow: inset 0 1px 1px alpha(#000000, 0.25); }
+scale highlight { border-radius: 999px; background-color: @accent_bg_color; border: none; }
+scale slider {
+  min-height: 20px; min-width: 20px; margin: -8px;
+  border-radius: 999px;
+  background-color: #ffffff;
+  border: none;
+  box-shadow: 0 1px 4px alpha(#000000, 0.45), inset 0 0 0 1px alpha(#000000, 0.08);
+}
+scale slider:hover { background-color: #f4f4f8; }
+levelbar block { border-radius: 999px; border: none; background-color: alpha(#ffffff, 0.12); min-height: 6px; }
+levelbar block.filled { background-color: @accent_bg_color; }
+levelbar block.high, levelbar block.full { background-color: @accent_bg_color; }
+levelbar block.low { background-color: @warning_color; }
+progressbar trough { border-radius: 999px; background-color: alpha(#ffffff, 0.12); border: none; min-height: 6px; }
+progressbar progress { border-radius: 999px; background-color: @accent_bg_color; border: none; min-height: 6px; }
+spinner { color: @accent_bg_color; }
+checkbutton check, checkbutton radio {
+  border-radius: 6px; border: 1px solid alpha(#ffffff, 0.22); background-color: alpha(#ffffff, 0.06);
+  min-width: 16px; min-height: 16px; -gtk-icon-source: none;
+}
+checkbutton radio { border-radius: 999px; }
+checkbutton check:checked, checkbutton radio:checked {
+  background-color: @accent_bg_color; border-color: transparent; color: #ffffff;
+  -gtk-icon-source: -gtk-icontheme("object-select-symbolic");
+}
+checkbutton radio:checked { -gtk-icon-source: none; box-shadow: inset 0 0 0 4px @accent_bg_color, inset 0 0 0 7px #ffffff; }
+
+.badge {
+  background-color: alpha(@accent_bg_color, 0.22);
+  color: @accent_bg_color;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1px;
+}
+.badge.count { min-width: 10px; padding: 1px 7px; }
+.badge.neutral, .badge.origin { background-color: alpha(#ffffff, 0.10); color: alpha(@window_fg_color, 0.75); font-weight: 600; }
+.badge.installed, .badge.success { background-color: alpha(@success_color, 0.18); color: @success_color; }
+.badge.update, .badge.warning { background-color: alpha(@warning_color, 0.18); color: @warning_color; }
+.badge.error { background-color: alpha(@error_color, 0.18); color: @error_color; }
+.success { color: @success_color; }
+.warning { color: @warning_color; }
+.error { color: @error_color; }
+
+.kbd {
+  border: 1px solid alpha(#ffffff, 0.16);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: alpha(@window_fg_color, 0.62);
+  background-color: alpha(#ffffff, 0.05);
+}
+
+.info-note {
+  background-color: alpha(@accent_bg_color, 0.10);
+  color: alpha(@window_fg_color, 0.80);
+  border: 1px solid alpha(@accent_bg_color, 0.22);
+  padding: 12px 14px;
+  border-radius: 12px;
+}
+.alert-card {
+  background-color: alpha(@warning_color, 0.10);
+  border: 1px solid alpha(@warning_color, 0.26);
+  border-radius: 14px;
+  padding: 16px;
+}
+.alert-icon { color: @warning_color; }
+
+banner { background-color: alpha(@accent_bg_color, 0.14); border-radius: 12px; }
+banner > revealer > widget { background-color: transparent; border-radius: 12px; padding: 8px 12px; }
+toast {
+  background-color: alpha(#2a2a33, 0.96);
+  border: 1px solid alpha(#ffffff, 0.10);
+  border-radius: 999px;
+  box-shadow: 0 10px 30px alpha(#000000, 0.45), inset 0 1px 0 alpha(#ffffff, 0.06);
+  color: @window_fg_color;
+}
+toast button { border-radius: 999px; }
+statuspage .icon { color: alpha(@window_fg_color, 0.30); }
+statuspage .title { font-weight: 700; letter-spacing: -0.4px; }
+statuspage .description { color: alpha(@window_fg_color, 0.70); }
+
+dialog, window.dialog, window.messagedialog, .dialog-content {
+  background-color: @dialog_bg_color;
+  border-radius: 14px;
+}
+window.dialog headerbar { border-bottom: none; }
+tooltip {
+  background-color: alpha(#26262f, 0.96);
+  border: 1px solid alpha(#ffffff, 0.10);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px alpha(#000000, 0.40);
+  padding: 4px 8px;
+}
+tooltip label { color: @window_fg_color; font-size: 13px; }
+
+/* Overlay scrollbars, thin and quiet. */
+scrollbar { background: transparent; border: none; }
+scrollbar slider {
+  min-width: 6px; min-height: 6px;
+  border-radius: 999px;
+  background-color: alpha(#ffffff, 0.22);
+  margin: 3px;
+  border: none;
+}
+scrollbar slider:hover { background-color: alpha(#ffffff, 0.36); }
+scrollbar.horizontal slider { min-height: 6px; }
+
+/* The dividing line between page columns and cards is air, not a rule. */
+separator.horizontal { background-color: alpha(#ffffff, 0.08); min-height: 1px; }
+separator.vertical { background-color: alpha(#ffffff, 0.08); min-width: 1px; }

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.ravenviewer.Raven</id>
+  <name>Raven Viewer</name>
+  <summary>Read PDF and DOCX files on Raven Linux</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>A fast, free document reader. Continuous PDF pages rendered in pure Rust, a table of contents and annotation list in the sidebar, search, zoom and dark pages; DOCX files open as a clean reading view. No browser, no account, nothing to pay for.</p>
+  </description>
+  <launchable type="desktop-id">com.ravenviewer.Raven.desktop</launchable>
+  <provides><binary>raven-viewer</binary></provides>
+  <url type="homepage">https://github.com/javanhut/RavenViewer</url>
+</component>

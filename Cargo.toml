@@ -1,0 +1,52 @@
+[package]
+name = "raven-viewer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+description = "Raven Viewer: a fast document reader for Raven Linux. PDF pages, outline and annotations; DOCX as a reading view."
+repository = "https://github.com/javanhut/RavenViewer"
+
+[[bin]]
+name = "raven-viewer"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the same gtk-rs generation as RavenStore, RavenSettingsUI and
+# RavenFileManager so every Raven app resolves one set of bindings.
+gtk4 = { version = "0.10", features = ["v4_12"] }
+# v1_7 for InlineViewSwitcher (the sidebar's Contents · Notes switch).
+# The image carries libadwaita 1.9.
+libadwaita = { version = "0.8", features = ["v1_7"] }
+glib = "0.21"
+gio = "0.21"
+# Render and search threads hand results to the GTK main loop over this.
+async-channel = "2"
+
+# The PDF stack is pure Rust on purpose: no C toolchain, no libclang, no
+# multi-minute first build. hayro rasterizes; lopdf reads the structure
+# hayro does not expose (outline, annotations) and will do the editing.
+hayro = "0.7"
+lopdf = "0.45"
+
+# DOCX is a zip of XML.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
+
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+
+[profile.dev]
+# Our own crate stays fast to compile; the renderer underneath it is
+# unusably slow unoptimized, so dependencies are always built with -O.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

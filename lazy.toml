@@ -1,0 +1,71 @@
+# ImLazy configuration file
+
+[settings]
+default = "build"
+
+[variables]
+app_id = "com.ravenviewer.Raven"
+binary = "raven-viewer"
+prefix = "/usr/local"
+bindir = "{{prefix}}/bin"
+datadir = "{{prefix}}/share"
+icondir = "{{datadir}}/icons/hicolor/scalable/apps"
+target = "target/release/{{binary}}"
+
+[commands]
+
+[commands.build]
+desc = "Build release binary"
+alias = ["b"]
+run = ["cargo build --locked --release"]
+
+[commands.dev]
+desc = "Fast debug build and run (pass a file with: imlazy dev -- FILE)"
+alias = ["d"]
+run = ["cargo run --"]
+
+[commands.test]
+desc = "Run all tests"
+alias = ["t"]
+run = ["cargo test --locked"]
+
+[commands.check]
+desc = "Run formatting, Clippy, and the test suite"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --locked --all-targets -- -D warnings",
+  "cargo test --locked",
+]
+
+[commands.install]
+desc = "Install raven-viewer, its desktop entry and file associations"
+dep = ["build"]
+escalate = true
+writes = ["{{bindir}}", "{{datadir}}", "{{icondir}}"]
+run = [
+  "install -Dm755 {{target}} {{bindir}}/{{binary}}",
+  "install -Dm644 data/{{app_id}}.desktop {{datadir}}/applications/{{app_id}}.desktop",
+  "install -Dm644 data/{{app_id}}.metainfo.xml {{datadir}}/metainfo/{{app_id}}.metainfo.xml",
+  "install -Dm644 data/icons/hicolor/scalable/apps/{{app_id}}.svg {{icondir}}/{{app_id}}.svg",
+  "sh -c 'command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q {{datadir}}/applications || true'",
+  "sh -c 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf {{datadir}}/icons/hicolor || true'",
+]
+
+[commands.set-default]
+desc = "Make Raven Viewer the default for PDF and DOCX (current user)"
+run = ["{{bindir}}/{{binary}} set-default"]
+
+[commands.uninstall]
+desc = "Remove raven-viewer"
+escalate = true
+writes = ["{{bindir}}", "{{datadir}}", "{{icondir}}"]
+run = [
+  "rm -f {{bindir}}/{{binary}}",
+  "rm -f {{datadir}}/applications/{{app_id}}.desktop",
+  "rm -f {{datadir}}/metainfo/{{app_id}}.metainfo.xml",
+  "rm -f {{icondir}}/{{app_id}}.svg",
+]
+
+[commands.clean]
+desc = "Clean build artifacts"
+run = ["cargo clean"]
