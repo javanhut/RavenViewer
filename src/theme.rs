@@ -18,17 +18,26 @@ const BASE_CSS: &str = concat!(
   box-shadow: 0 1px 2px alpha(#000000, 0.30), 0 8px 24px alpha(#000000, 0.28);
 }
 .page.dark-page { filter: invert(0.88) hue-rotate(180deg); }
-.page-pill {
+/* The page counter is a button now — click it to jump to a page — so the
+   pill is drawn on the inner button rather than on the widget itself. */
+.page-pill { margin: 14px; }
+.page-pill > button {
   background-color: alpha(#26262f, 0.88);
+  color: #ffffff;
   border: 1px solid alpha(#ffffff, 0.10);
   border-radius: 999px;
-  padding: 4px 12px;
-  margin: 14px;
+  padding: 4px 8px 4px 12px;
+  min-height: 0;
+  min-width: 0;
   font-size: 12px;
   font-weight: 600;
   font-feature-settings: "tnum";
   box-shadow: 0 6px 20px alpha(#000000, 0.35);
 }
+.page-pill > button:hover { background-color: alpha(#3a3a46, 0.94); }
+.page-pill > button:active, .page-pill:checked > button { background-color: alpha(#4a4a58, 0.96); }
+.jump-to-page { padding: 4px; }
+.jump-to-page entry { font-feature-settings: "tnum"; }
 .outline-row { padding: 6px 8px; }
 .outline-row .page-number { font-size: 12px; font-feature-settings: "tnum"; color: alpha(@window_fg_color, 0.55); }
 .outline-row.level-1 { padding-left: 22px; }

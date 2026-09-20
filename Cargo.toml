@@ -26,6 +26,7 @@ async-channel = "2"
 # The PDF stack is pure Rust on purpose: no C toolchain, no libclang, no
 # multi-minute first build. hayro rasterizes; lopdf reads the structure
 # hayro does not expose (outline, annotations) and will do the editing.
+# Patched locally for tiled rendering — see vendor/hayro/RAVEN-PATCH.md.
 hayro = "0.7"
 lopdf = "0.45"
 
@@ -50,3 +51,11 @@ debug = false
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# hayro 0.7 can only rasterize a page from its top-left corner, so a deep zoom
+# had to draw the whole page to show a corner of it. vendor/hayro adds an
+# offset to RenderSettings; everything under it is stock upstream, and only
+# the thin facade crate is vendored — hayro-interpret, hayro-syntax and the
+# font and image codecs still come from crates.io.
+[patch.crates-io]
+hayro = { path = "vendor/hayro" }

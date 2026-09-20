@@ -5,6 +5,7 @@
 mod config;
 mod docx;
 mod docxview;
+mod pagetiles;
 mod pdf;
 mod pdfview;
 mod theme;

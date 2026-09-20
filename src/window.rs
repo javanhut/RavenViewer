@@ -36,7 +36,10 @@ struct State {
     toasts: adw::ToastOverlay,
     outline: gtk::ListBox,
     notes: gtk::ListBox,
-    pill: gtk::Label,
+    pill: gtk::MenuButton,
+    pill_label: gtk::Label,
+    page_entry: gtk::Entry,
+    page_total: gtk::Label,
     zoom_label: gtk::Button,
     search_bar: gtk::SearchBar,
     search: gtk::SearchEntry,
@@ -141,8 +144,26 @@ impl Window {
         let content = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
         content.add_named(&welcome, Some("welcome"));
 
-        let pill = gtk::Label::builder()
-            .css_classes(["page-pill"])
+        // The page counter doubles as "go to page": in a 700-page book the
+        // scrollbar is a blunt instrument and not every file has an outline.
+        let page_entry = gtk::Entry::builder()
+            .input_purpose(gtk::InputPurpose::Digits)
+            .max_width_chars(7)
+            .width_chars(7)
+            .xalign(0.5)
+            .build();
+        let page_total = gtk::Label::builder().css_classes(["dim-label"]).build();
+        let jump = gtk::Box::builder().spacing(8).css_classes(["jump-to-page"]).build();
+        jump.append(&gtk::Label::new(Some("Page")));
+        jump.append(&page_entry);
+        jump.append(&page_total);
+        let pill_label = gtk::Label::new(None);
+        let pill = gtk::MenuButton::builder()
+            .popover(&gtk::Popover::builder().child(&jump).build())
+            .child(&pill_label)
+            .always_show_arrow(true)
+            .tooltip_text("Go to page (Ctrl+G)")
+            .css_classes(["page-pill", "flat"])
             .halign(gtk::Align::Center)
             .valign(gtk::Align::End)
             .visible(false)
@@ -188,6 +209,9 @@ impl Window {
             outline,
             notes,
             pill,
+            pill_label,
+            page_entry,
+            page_total,
             zoom_label,
             search_bar,
             search,
@@ -270,7 +294,7 @@ impl Window {
         self.fill_notes(&info, &view);
 
         let n = view.page_count();
-        let (pill, subtitle) = (self.0.pill.clone(), self.0.title.clone());
+        let (pill, subtitle) = (self.0.pill_label.clone(), self.0.title.clone());
         let update = move |page: usize| {
             let text = format!("{} of {n}", page + 1);
             pill.set_label(&text);
@@ -278,6 +302,7 @@ impl Window {
         };
         update(0);
         view.connect_page_changed(update);
+        self.0.page_total.set_label(&format!("of {n}"));
         let zoom_label = self.0.zoom_label.clone();
         view.connect_zoom_changed(move |z| zoom_label.set_label(&format!("{:.0}%", z * 100.0)));
         self.0.pill.set_visible(true);
@@ -392,6 +417,13 @@ impl Window {
         });
     }
 
+    fn pdf_page_count(&self) -> usize {
+        match self.0.doc.borrow().as_ref() {
+            Some(Doc::Pdf { view, .. }) => view.page_count(),
+            _ => 0,
+        }
+    }
+
     fn with_pdf(&self, f: impl FnOnce(&PdfView)) {
         if let Some(Doc::Pdf { view, .. }) = self.0.doc.borrow().as_ref() {
             f(view);
@@ -442,6 +474,13 @@ impl Window {
         add("fit", Box::new(|w| { w.with_pdf(|v| v.fit_width()); w.sync_zoom_label(); }));
         add("next-page", Box::new(|w| w.with_pdf(|v| v.next_page())));
         add("prev-page", Box::new(|w| w.with_pdf(|v| v.prev_page())));
+        add("first-page", Box::new(|w| w.with_pdf(|v| v.first_page())));
+        add("last-page", Box::new(|w| w.with_pdf(|v| v.last_page())));
+        add("go-to-page", Box::new(|w| {
+            if w.0.pill.is_visible() {
+                w.0.pill.popup();
+            }
+        }));
         add("find", Box::new(|w| {
             let on = !w.0.search_bar.is_search_mode();
             w.0.search_bar.set_search_mode(on);
@@ -493,6 +532,9 @@ impl Window {
             ("win.sidebar", &["F9"]),
             ("win.next-page", &["<Ctrl>Page_Down", "n"]),
             ("win.prev-page", &["<Ctrl>Page_Up", "p"]),
+            ("win.first-page", &["<Ctrl>Home"]),
+            ("win.last-page", &["<Ctrl>End"]),
+            ("win.go-to-page", &["<Ctrl>g"]),
             ("win.shortcuts", &["<Ctrl>question"]),
             ("win.close", &["<Ctrl>w"]),
         ] {
@@ -501,6 +543,34 @@ impl Window {
     }
 
     fn connect_signals(&self) {
+        let this = self.clone();
+        self.0.page_entry.connect_activate(move |entry| {
+            let count = this.pdf_page_count();
+            match entry.text().trim().parse::<usize>().ok().filter(|&n| n >= 1 && n <= count) {
+                Some(page) => {
+                    entry.remove_css_class("error");
+                    this.with_pdf(|v| v.go_to(page - 1, 0.0));
+                    this.0.pill.popdown();
+                }
+                None => entry.add_css_class("error"),
+            }
+        });
+        self.0.page_entry.connect_changed(|entry| entry.remove_css_class("error"));
+
+        // Open on the page being read, ready to be typed over.
+        if let Some(popover) = self.0.pill.popover() {
+            let (this, entry) = (self.clone(), self.0.page_entry.clone());
+            popover.connect_show(move |_| {
+                this.with_pdf(|v| entry.set_text(&(v.current_page() + 1).to_string()));
+                entry.remove_css_class("error");
+                let entry = entry.clone();
+                glib::idle_add_local_once(move || {
+                    entry.grab_focus();
+                    entry.select_region(0, -1);
+                });
+            });
+        }
+
         let this = self.clone();
         self.0.search.connect_activate(move |_| this.find_next(false));
         let this = self.clone();
@@ -571,6 +641,8 @@ impl Window {
             ("Zoom in / out", "Ctrl++ / Ctrl+− · Ctrl+scroll"),
             ("Fit width", "Ctrl+0"),
             ("Next / previous page", "N / P · Ctrl+PgDn / PgUp"),
+            ("Go to page", "Ctrl+G"),
+            ("First / last page", "Ctrl+Home / Ctrl+End"),
             ("Toggle sidebar", "F9"),
             ("Close window", "Ctrl+W"),
         ];
@@ -610,10 +682,10 @@ enum Loaded {
 
 /// Sniff the bytes, not the extension: a PDF saved as .bin still opens.
 fn load(path: &Path) -> anyhow::Result<Loaded> {
-    let bytes = std::fs::read(path)?;
+    let bytes = Arc::new(std::fs::read(path)?);
     if bytes.windows(5).take(1024).any(|w| w == b"%PDF-") {
         let info = pdf::load_info(&bytes)?;
-        return Ok(Loaded::Pdf(Arc::new(bytes), info));
+        return Ok(Loaded::Pdf(bytes, info));
     }
     if bytes.starts_with(b"PK") {
         return Ok(Loaded::Docx(docx::load(&bytes)?));
