@@ -96,8 +96,9 @@ pub fn apply() {
     watch_desktop();
 }
 
-/// Re-read desktop.toml and apply it: light/dark, the accent, and glass on
-/// the open windows. The overlay provider is replaced, never stacked.
+/// Re-read desktop.toml and apply it: light/dark, the accent, the glass
+/// theme, and glass on the open windows. The overlay provider is replaced,
+/// never stacked.
 fn refresh() {
     let appearance = Desktop::load().appearance;
     adw::StyleManager::default().set_color_scheme(match appearance.theme_mode {
@@ -108,9 +109,10 @@ fn refresh() {
     let accent = if is_hex(&appearance.accent) { appearance.accent.as_str() } else { DEFAULT_ACCENT };
     let light = appearance.theme_mode == ThemeMode::Light;
     let css = format!(
-        "@define-color accent_bg_color {accent};\n@define-color accent_color {accent};\n{}{}",
+        "@define-color accent_bg_color {accent};\n@define-color accent_color {accent};\n{}{}{}",
         if light { include_str!("../data/raven-glass-light.css") } else { "" },
-        if light { LIGHT_CSS } else { "" }
+        if light { LIGHT_CSS } else { "" },
+        crate::glass_tint::css(&appearance.glass_theme, light),
     );
     if let Some(display) = gtk::gdk::Display::default() {
         OVERLAY.with(|slot| {
