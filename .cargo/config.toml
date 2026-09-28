@@ -2,3 +2,10 @@
 # incremental rebuild's wall time.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Build Raven Glass from the RavenGUI checkout beside this one rather than the
+# copy on GitHub, so a change to the shared look is tried here before it is
+# pushed. The image build checks every app out beside RavenGUI, so it takes
+# this path too. Delete this table to use the git dependency as it is.
+[patch."https://github.com/javanhut/RavenGUI.git"]
+raven-glass = { path = "../RavenGUI/crates/raven-glass" }

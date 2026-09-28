@@ -5,7 +5,6 @@
 mod config;
 mod docx;
 mod docxview;
-mod glass_tint;
 mod pagetiles;
 mod pdf;
 mod pdfedit;
