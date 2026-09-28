@@ -23,7 +23,8 @@ pub struct Appearance {
     pub theme_mode: ThemeMode,
     pub accent: String,
     pub transparency: bool,
-    /// Settings' glass theme (black, fog, arctic, midnight, rose).
+    /// Settings' glass theme (black, fog, arctic, midnight, rose, tokyo-neon,
+    /// clear, ember, nebula).
     pub glass_theme: String,
 }
 
