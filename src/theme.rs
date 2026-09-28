@@ -57,6 +57,12 @@ const BASE_CSS: &str = concat!(
   padding: 48px 56px;
 }
 .docx-sheet textview, .docx-sheet textview text { background-color: transparent; }
+.docx-sheet.editing { border-color: alpha(@accent_bg_color, 0.55); }
+.format-bar { padding: 4px 8px; }
+.format-bar .bold-label { font-weight: 800; }
+.format-bar .italic-label { font-style: italic; font-family: serif; }
+.format-bar .underline-label { text-decoration: underline; }
+.selection-tools { padding: 2px; }
 .welcome .title-1 { font-size: 30px; font-weight: 800; letter-spacing: -0.8px; }
 "#
 );
@@ -191,6 +197,14 @@ fn watch_desktop() {
 }
 
 /// Whether the desktop asked for translucent windows.
+/// The desktop's accent colour, for what the viewer paints itself (the text
+/// selection) rather than through CSS.
+pub fn accent() -> gtk::gdk::RGBA {
+    let accent = Desktop::load().appearance.accent;
+    let hex = if is_hex(&accent) { accent.as_str() } else { DEFAULT_ACCENT };
+    gtk::gdk::RGBA::parse(hex).unwrap_or(gtk::gdk::RGBA::new(0.48, 0.64, 0.97, 1.0))
+}
+
 pub fn glass() -> bool {
     Desktop::load().appearance.transparency
 }

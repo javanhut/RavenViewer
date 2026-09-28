@@ -70,6 +70,8 @@ pub struct ViewerConfig {
     pub dark_pages: bool,
     /// Last-read page per file, so a reopened book resumes where you were.
     pub remember_position: bool,
+    /// Colour for new highlights: yellow, green, blue or pink.
+    pub highlight_color: String,
     pub positions: std::collections::BTreeMap<String, usize>,
 }
 
@@ -79,6 +81,7 @@ impl Default for ViewerConfig {
             show_sidebar: true,
             dark_pages: false,
             remember_position: true,
+            highlight_color: "yellow".into(),
             positions: Default::default(),
         }
     }

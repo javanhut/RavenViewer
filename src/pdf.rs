@@ -7,6 +7,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use anyhow::{Result, anyhow};
 use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_interpret::util::TransformExt;
+use hayro::vello_cpu::kurbo::{Affine, Rect};
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
@@ -22,11 +24,18 @@ pub struct OutlineEntry {
 
 #[derive(Debug, Clone)]
 pub struct Annotation {
+    /// The annotation's object, when it is one (and not inline in /Annots),
+    /// so it can be edited or removed.
+    pub id: Option<lopdf::ObjectId>,
     pub page: usize,
     pub kind: String,
     pub contents: String,
     /// Distance of the annotation's top edge from the top of the page, 0..1.
     pub y_fraction: f64,
+    /// Where it is on the page as displayed, as fractions (x0, y0, x1, y1).
+    pub rect: Option<[f32; 4]>,
+    /// The same in PDF user space, until the page geometry is known.
+    user_rect: Option<[f32; 4]>,
 }
 
 /// Everything the window needs before the first pixel is drawn.
@@ -37,6 +46,17 @@ pub struct DocumentInfo {
     pub page_sizes: Vec<(f32, f32)>,
     pub outline: Vec<OutlineEntry>,
     pub annotations: Vec<Annotation>,
+    /// Per page, the affine map from a point on the page as displayed (as
+    /// fractions, y down) to PDF user space — where a click puts a note.
+    pub to_user: Vec<[f64; 6]>,
+}
+
+impl DocumentInfo {
+    pub fn user_point(&self, page: usize, fx: f32, fy: f32) -> (f32, f32) {
+        let m = self.to_user.get(page).copied().unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let (x, y) = (fx as f64, fy as f64);
+        ((m[0] * x + m[2] * y + m[4]) as f32, (m[1] * x + m[3] * y + m[5]) as f32)
+    }
 }
 
 /// Takes the bytes by `Arc`: hayro borrows them instead of copying, so a
@@ -47,14 +67,29 @@ pub fn load_info(bytes: &Arc<Vec<u8>>) -> Result<DocumentInfo> {
     if page_sizes.is_empty() {
         return Err(anyhow!("the document has no pages"));
     }
+    let to_user: Vec<Affine> = pdf
+        .pages()
+        .iter()
+        .map(|p| {
+            let (w, h) = p.render_dimensions();
+            p.initial_transform(true).to_kurbo().inverse() * Affine::scale_non_uniform(w as f64, h as f64)
+        })
+        .collect();
 
     // The outline and annotations are a nicety: a file lopdf cannot parse
     // still opens, it just has an empty sidebar.
-    let mut info = DocumentInfo { page_sizes, ..Default::default() };
+    let mut info = DocumentInfo { page_sizes, to_user: to_user.iter().map(|a| a.as_coeffs()).collect(), ..Default::default() };
     if let Ok(doc) = lopdf::Document::load_mem(bytes) {
         info.title = doc_title(&doc);
         info.outline = outline(&doc, info.page_sizes.len());
         info.annotations = annotations(&doc);
+    }
+    for a in &mut info.annotations {
+        let (Some(r), Some(m)) = (a.user_rect, to_user.get(a.page)) else { continue };
+        let shown = m.inverse().transform_rect_bbox(Rect::new(r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64));
+        a.rect = Some([shown.x0 as f32, shown.y0 as f32, shown.x1 as f32, shown.y1 as f32]);
+        // Measured on the page as shown, which is right for a turned page too.
+        a.y_fraction = shown.y0.clamp(0.0, 1.0);
     }
     Ok(info)
 }
@@ -92,9 +127,9 @@ fn annotations(doc: &lopdf::Document) -> Vec<Annotation> {
         };
         let height = page_height(doc, page_id);
         for annot in annots {
-            let dict = match annot {
-                lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
-                other => other.as_dict().ok(),
+            let (id, dict) = match annot {
+                lopdf::Object::Reference(id) => (Some(*id), doc.get_dictionary(*id).ok()),
+                other => (None, other.as_dict().ok()),
             };
             let Some(dict) = dict else { continue };
             let kind = dict
@@ -111,20 +146,19 @@ fn annotations(doc: &lopdf::Document) -> Vec<Annotation> {
                 .ok()
                 .and_then(|c| lopdf::decode_text_string(c).ok())
                 .unwrap_or_default();
-            let top = dict
-                .get_deref(b"Rect", doc)
-                .and_then(|r| r.as_array())
-                .ok()
-                .and_then(|r| {
-                    let ys: Vec<f32> = [1, 3].iter().filter_map(|&i| r.get(i)?.as_float().ok()).collect();
-                    ys.into_iter().reduce(f32::max)
-                })
-                .unwrap_or(height);
+            let user_rect = dict.get_deref(b"Rect", doc).and_then(|r| r.as_array()).ok().and_then(|r| {
+                let v: Vec<f32> = r.iter().filter_map(|n| n.as_float().ok()).collect();
+                (v.len() == 4).then(|| [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])])
+            });
+            let top = user_rect.map_or(height, |r| r[3]);
             out.push(Annotation {
+                id,
                 page: number as usize - 1,
                 kind,
                 contents: contents.trim().to_string(),
                 y_fraction: ((height - top) / height).clamp(0.0, 1.0) as f64,
+                rect: None,
+                user_rect,
             });
         }
     }
@@ -331,6 +365,17 @@ impl Renderer {
         list.generation
     }
 
+    /// Carry on from another renderer's generation — when a new copy of the
+    /// document replaces the old one under the same pages, textures drawn
+    /// from the old copy must not pass for current.
+    pub fn continue_from(&self, generation: u64) {
+        let (lock, idle) = &*self.shared;
+        let mut list = lock_wishlist(lock);
+        list.generation = list.generation.max(generation) + 1;
+        list.wanted.clear();
+        idle.notify_all();
+    }
+
     pub fn generation(&self) -> u64 {
         lock_wishlist(&self.shared.0).generation
     }
@@ -431,6 +476,100 @@ fn render_loop(bytes: Arc<Vec<u8>>, shared: &(Mutex<Wishlist>, Condvar), results
         {
             return; // the window is gone
         }
+    }
+}
+
+/// Search compares normalized text: lower-case, no whitespace, ligatures
+/// expanded, typographic punctuation flattened. Extracted PDF text often
+/// loses word spaces ("Self-OrganizingMaps") and keeps ligatures ("deﬁned"),
+/// so a literal comparison misses matches a reader can plainly see.
+pub fn normalize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            c if c.is_whitespace() => {}
+            '\u{00AD}' => {} // soft hyphen
+            'ﬀ' => out.push_str("ff"),
+            'ﬁ' => out.push_str("fi"),
+            'ﬂ' => out.push_str("fl"),
+            'ﬃ' => out.push_str("ffi"),
+            'ﬄ' => out.push_str("ffl"),
+            'ﬅ' | 'ﬆ' => out.push_str("st"),
+            '‘' | '’' => out.push('\''),
+            '“' | '”' => out.push('"'),
+            '‐' | '‑' | '–' | '—' => out.push('-'),
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
+struct SearchRequest {
+    query: String,
+    start: usize,
+    backwards: bool,
+    reply: async_channel::Sender<Option<usize>>,
+}
+
+/// Text search on its own thread. Extracting text is ~20ms a page, so a
+/// whole book up front is many seconds; instead pages are read lazily in
+/// search order, cached, and a search stops at the first hit. A new query
+/// arriving mid-scan replaces the old one immediately.
+pub struct Searcher {
+    tx: mpsc::Sender<SearchRequest>,
+}
+
+impl Searcher {
+    pub fn spawn(bytes: Arc<Vec<u8>>, pages: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<SearchRequest>();
+        let _ = std::thread::Builder::new()
+            .name("raven-search".into())
+            .spawn(move || search_loop(&bytes, pages, rx));
+        Self { tx }
+    }
+
+    /// First page after `start` (wrapping, `start` itself last) whose text
+    /// contains `query`, compared case-insensitively.
+    pub async fn find(&self, query: &str, start: usize, backwards: bool) -> Option<usize> {
+        let (reply, answer) = async_channel::bounded(1);
+        let req = SearchRequest { query: normalize(query), start, backwards, reply };
+        self.tx.send(req).ok()?;
+        answer.recv().await.ok().flatten()
+    }
+}
+
+fn search_loop(bytes: &[u8], pages: usize, rx: mpsc::Receiver<SearchRequest>) {
+    let doc = lopdf::Document::load_mem(bytes).ok();
+    let mut cache: Vec<Option<String>> = vec![None; pages];
+    let mut pending: Option<SearchRequest> = None;
+
+    'requests: loop {
+        let req = match pending.take() {
+            Some(r) => r,
+            None => match rx.recv() {
+                Ok(r) => r,
+                Err(_) => return,
+            },
+        };
+        if pages == 0 || req.query.is_empty() {
+            let _ = req.reply.send_blocking(None);
+            continue;
+        }
+        for i in 1..=pages {
+            if let Ok(newer) = rx.try_recv() {
+                pending = Some(newer);
+                continue 'requests; // the old caller's reply channel just closes
+            }
+            let page = if req.backwards { (req.start + pages - i % pages) % pages } else { (req.start + i) % pages };
+            let text = cache[page].get_or_insert_with(|| {
+                normalize(&doc.as_ref().and_then(|d| d.extract_text(&[page as u32 + 1]).ok()).unwrap_or_default())
+            });
+            if text.contains(&req.query) {
+                let _ = req.reply.send_blocking(Some(page));
+                continue 'requests;
+            }
+        }
+        let _ = req.reply.send_blocking(None);
     }
 }
 
@@ -771,7 +910,9 @@ mod tests {
 
         let pixmap = hayro::vello_cpu::Pixmap::from_parts(
             page.pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|p| hayro::vello_cpu::color::PremulRgba8 { r: p[0], g: p[1], b: p[2], a: p[3] })
                 .collect(),
             page.width as u16,
@@ -786,99 +927,3 @@ mod tests {
         eprintln!("search {query:?} from page 1: {hit:?} in {:?}", t.elapsed());
     }
 }
-
-/// Search compares normalized text: lower-case, no whitespace, ligatures
-/// expanded, typographic punctuation flattened. Extracted PDF text often
-/// loses word spaces ("Self-OrganizingMaps") and keeps ligatures ("deﬁned"),
-/// so a literal comparison misses matches a reader can plainly see.
-pub fn normalize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            c if c.is_whitespace() => {}
-            '\u{00AD}' => {} // soft hyphen
-            'ﬀ' => out.push_str("ff"),
-            'ﬁ' => out.push_str("fi"),
-            'ﬂ' => out.push_str("fl"),
-            'ﬃ' => out.push_str("ffi"),
-            'ﬄ' => out.push_str("ffl"),
-            'ﬅ' | 'ﬆ' => out.push_str("st"),
-            '‘' | '’' => out.push('\''),
-            '“' | '”' => out.push('"'),
-            '‐' | '‑' | '–' | '—' => out.push('-'),
-            c => out.extend(c.to_lowercase()),
-        }
-    }
-    out
-}
-
-struct SearchRequest {
-    query: String,
-    start: usize,
-    backwards: bool,
-    reply: async_channel::Sender<Option<usize>>,
-}
-
-/// Text search on its own thread. Extracting text is ~20ms a page, so a
-/// whole book up front is many seconds; instead pages are read lazily in
-/// search order, cached, and a search stops at the first hit. A new query
-/// arriving mid-scan replaces the old one immediately.
-pub struct Searcher {
-    tx: mpsc::Sender<SearchRequest>,
-}
-
-impl Searcher {
-    pub fn spawn(bytes: Arc<Vec<u8>>, pages: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<SearchRequest>();
-        let _ = std::thread::Builder::new()
-            .name("raven-search".into())
-            .spawn(move || search_loop(&bytes, pages, rx));
-        Self { tx }
-    }
-
-    /// First page after `start` (wrapping, `start` itself last) whose text
-    /// contains `query`, compared case-insensitively.
-    pub async fn find(&self, query: &str, start: usize, backwards: bool) -> Option<usize> {
-        let (reply, answer) = async_channel::bounded(1);
-        let req = SearchRequest { query: normalize(query), start, backwards, reply };
-        self.tx.send(req).ok()?;
-        answer.recv().await.ok().flatten()
-    }
-}
-
-fn search_loop(bytes: &[u8], pages: usize, rx: mpsc::Receiver<SearchRequest>) {
-    let doc = lopdf::Document::load_mem(bytes).ok();
-    let mut cache: Vec<Option<String>> = vec![None; pages];
-    let mut pending: Option<SearchRequest> = None;
-
-    'requests: loop {
-        let req = match pending.take() {
-            Some(r) => r,
-            None => match rx.recv() {
-                Ok(r) => r,
-                Err(_) => return,
-            },
-        };
-        if pages == 0 || req.query.is_empty() {
-            let _ = req.reply.send_blocking(None);
-            continue;
-        }
-        for i in 1..=pages {
-            if let Ok(newer) = rx.try_recv() {
-                pending = Some(newer);
-                continue 'requests; // the old caller's reply channel just closes
-            }
-            let page = if req.backwards { (req.start + pages - i % pages) % pages } else { (req.start + i) % pages };
-            let text = cache[page].get_or_insert_with(|| {
-                normalize(&doc.as_ref().and_then(|d| d.extract_text(&[page as u32 + 1]).ok()).unwrap_or_default())
-            });
-            if text.contains(&req.query) {
-                let _ = req.reply.send_blocking(Some(page));
-                continue 'requests;
-            }
-        }
-        let _ = req.reply.send_blocking(None);
-    }
-}
-
-

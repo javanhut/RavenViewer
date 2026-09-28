@@ -41,6 +41,9 @@ mod imp {
     pub struct PageTiles {
         pub(super) layers: RefCell<Layers>,
         pub(super) bytes: Cell<usize>,
+        /// Translucent boxes over the page — the text selection — as
+        /// fractions of the page like everything else.
+        pub(super) marks: RefCell<Vec<([f32; 4], gdk::RGBA)>>,
     }
 
     #[glib::object_subclass]
@@ -88,6 +91,15 @@ mod imp {
             }
             for piece in &layers.current {
                 place(piece);
+            }
+            for (r, color) in self.marks.borrow().iter() {
+                let rect = graphene::Rect::new(
+                    r[0] * width as f32,
+                    r[1] * height as f32,
+                    (r[2] - r[0]) * width as f32,
+                    (r[3] - r[1]) * height as f32,
+                );
+                snapshot.append_color(color, &rect);
             }
         }
     }
@@ -180,6 +192,16 @@ impl PageTiles {
         self.invalidate_contents();
     }
 
+    /// Replace the boxes drawn over the page.
+    pub fn set_marks(&self, marks: Vec<([f32; 4], gdk::RGBA)>) {
+        let inner = self.imp();
+        if *inner.marks.borrow() == marks {
+            return;
+        }
+        *inner.marks.borrow_mut() = marks;
+        self.invalidate_contents();
+    }
+
     /// Drop every texture; the page goes back to blank paper.
     pub fn clear(&self) {
         let inner = self.imp();
@@ -224,10 +246,10 @@ mod tests {
     /// one thread that initialized it.
     #[test]
     fn tiles_are_placed_by_their_share_of_the_page() {
-        if gtk::init().is_err() {
-            eprintln!("no display: skipping the paintable placement test");
-            return;
-        }
+        crate::gtk_test::run(placement);
+    }
+
+    fn placement() {
 
         let tiles = PageTiles::new();
         let quadrants = [(0.0, 0.0), (0.5, 0.0), (0.0, 0.5), (0.5, 0.5)];
