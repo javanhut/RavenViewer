@@ -27,7 +27,7 @@ installed alongside: everything is done by Raven Viewer itself.
 | **Mark up PDFs** | Highlight (four colours), underline or strike out the selection; add sticky notes and text boxes; edit or delete them from the page's right-click menu or the Notes sidebar. Written as standard annotations with appearance streams, so every reader shows them |
 | **Pages** | Right-click a page (or Menu → Page) to rotate it, move it up or down, or delete it |
 | **Undo & save** | `Ctrl+Z` / `Ctrl+Shift+Z` step through PDF edits; `Ctrl+S` saves, `Ctrl+Shift+S` saves a copy. Closing or opening another file with unsaved changes asks first |
-| **Word documents** | `.docx` and Word 97–2003 `.doc` open as a clean reading view: headings, emphasis, alignment, lists, tables, quotes and pictures |
+| **Word documents** | `.docx` and Word 97–2003 `.doc` open looking as they do in Word: the document's own styles (fonts, sizes, colours, spacing, indents, borders and shading), numbered and bulleted lists with their real numbers, tables with their column widths, cell borders, shading and padding, pictures (EMF drawings included) and floating pictures and text boxes where they were placed, equations, and the fonts the document embeds |
 | **Edit** | `Ctrl+E` or the pencil: type into the document, bold / italic / underline / highlight, and headings, quotes and bullets from the formatting bar. Paragraphs you don't touch are saved byte for byte, so fields and styles survive; paragraphs holding equations, fields or charts are shown read-only rather than risk them |
 | **Pictures** | Shown in the text. Insert Picture… (formatting bar or right-click), paste one (`Ctrl+V` — a screenshot, a picture copied from a browser, or picture files copied in the file manager), or drop picture files onto the page. They can be typed around, cut, copied, pasted and deleted like a character, and undo brings them back |
 | **New documents** | `Ctrl+N` or Menu → New Document: a blank page with Word's standard styles, on Letter or A4 paper by your locale. Save asks where it goes |
@@ -186,11 +186,26 @@ refused with a message rather than misread.
 A **text file** is read as UTF-8, UTF-16 (by its byte order mark) or
 Windows-1252, one paragraph per line, and written back as UTF-8.
 
+**Styles** (`look.rs`) are resolved the way Word resolves them: document
+defaults, then the `basedOn` chain of paragraph styles, the table style,
+character styles, and the paragraph's and run's own properties; theme fonts
+and colours are looked up in the theme. List numbers come from
+`numbering.xml`, counted per list and level (`%1.%2`, letters, roman), with
+restarts and overrides. Every paragraph carries the result, so the editor,
+the PDF export and a `.doc` save all set it the same way.
+
 **PDF export** (`render.rs`) lays the document out with Pango and draws it
-with Cairo's PDF surface: the document's paper and margins, its default
-font and size, Word's standard heading sizes, lists, tables and pictures
-(JPEGs are embedded as they are). Line by line pagination keeps headings
-with the text after them. Headings become the PDF's bookmarks.
+with Cairo's PDF surface, section by section: each section's paper and
+margins, its headers and footers (first-page ones too), page numbers and
+page counts, footnotes at the foot of the page that refers to them and
+endnotes after the text. Line spacing follows Word: lines are set by the
+metrics of the font the document asks for, so a document set in Arial or
+Calibri paginates as it does in Word even where only a stand-in is
+installed. Fonts a DOCX embeds (`fonts.rs` undoes Word's obfuscation and
+restores names that web fonts ship without) are used for the view and the
+PDF. Floating pictures, shapes and text boxes are placed by their anchors,
+in front of or behind the text; EMF pictures (`emf.rs`) are drawn as
+vectors. Headings become the PDF's bookmarks.
 
 **Undo** (`history.rs`) records every change to the editor's buffer — text,
 pictures, formatting, and the marks that tie paragraphs to the file — and
@@ -232,5 +247,5 @@ crates.io. See `vendor/hayro/RAVEN-PATCH.md`.
 - Signing
 - Password-protected PDFs (the engine supports them; the prompt is missing)
 - Resizing pictures in documents; editing table cells
-- Headers, footers and notes when reading and writing Word files
+- Headers, footers and notes when writing `.doc` files, and showing them in the editor
 - Printing (the PDF export's layout would serve it)

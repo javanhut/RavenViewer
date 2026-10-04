@@ -15,6 +15,7 @@
 //! clipboard or a drop.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk4 as gtk;
@@ -23,7 +24,9 @@ use gtk4::{gdk, gio, glib};
 use libadwaita as adw;
 
 use crate::history::History;
-use crate::docx::{self, Align, Block, Docx, Image, ItemKind, LINE_BREAK, Out, PageSetup, ParaStyle, Run, normalize};
+use crate::docx::{self, Block, Docx, Image, ItemKind, LINE_BREAK, Out, PageSetup, ParaStyle, Run, Table, normalize};
+use crate::look::{Line, Look, RunLook, Vert};
+use crate::render;
 
 pub use picture::Picture;
 
@@ -95,6 +98,14 @@ mod picture {
         }
     }
 
+    /// A Cairo image as a texture GTK can draw.
+    pub fn texture_of(mut surface: cairo::ImageSurface) -> Option<gdk::Texture> {
+        let (w, h, stride) = (surface.width(), surface.height(), surface.stride() as usize);
+        let data = surface.data().ok()?.to_vec();
+        let format = if cfg!(target_endian = "little") { gdk::MemoryFormat::B8g8r8a8Premultiplied } else { gdk::MemoryFormat::A8r8g8b8Premultiplied };
+        Some(gdk::MemoryTexture::new(w, h, format, &glib::Bytes::from_owned(data), stride).upcast())
+    }
+
     glib::wrapper! {
         /// A picture in the text, carrying the picture it shows.
         pub struct Picture(ObjectSubclass<imp::Picture>) @implements gdk::Paintable;
@@ -117,6 +128,8 @@ mod picture {
             let (mut w, mut h) = if image.cx > 0 && image.cy > 0 {
                 let px = |emu: i64| emu as f64 * 96.0 / EMU_PER_INCH as f64;
                 (px(image.cx), px(image.cy))
+            } else if let Some((w, h)) = crate::emf::size(&image.data) {
+                (w * 96.0 / 72.0, h * 96.0 / 72.0)
             } else {
                 let _ = imp.image.set(image.clone());
                 obj.texture().map_or((96.0, 96.0), |t| (t.width() as f64, t.height() as f64))
@@ -137,7 +150,7 @@ mod picture {
         }
 
         pub fn image(&self) -> Image {
-            self.imp().image.get().cloned().unwrap_or_else(|| Image { data: Default::default(), cx: 0, cy: 0, origin: None })
+            self.imp().image.get().cloned().unwrap_or_else(|| Image { data: Default::default(), cx: 0, cy: 0, origin: None, anchor: None })
         }
 
         fn texture(&self) -> Option<gdk::Texture> {
@@ -147,6 +160,13 @@ mod picture {
                     let data = &imp.image.get()?.data;
                     if data.is_empty() {
                         return None;
+                    }
+                    if crate::emf::is_emf(data) {
+                        // A metafile, drawn into pixels at twice its size on
+                        // screen, for sharpness.
+                        let (w, h) = imp.size.get();
+                        let surface = crate::emf::rasterize(data, w * 2, h * 2)?;
+                        return texture_of(surface);
                     }
                     gdk::Texture::from_bytes(&glib::Bytes::from(&data[..])).ok()
                 })
@@ -224,6 +244,17 @@ struct Inner {
     /// Sets this view's text size for its zoom.
     zoom_css: gtk::CssProvider,
     on_zoom: RefCell<Option<ZoomListener>>,
+    /// The text view's own font size, in points: what tags scale from.
+    base_pt: f64,
+    /// Tags made for the document's looks, by what they show.
+    para_tags: RefCell<HashMap<String, (gtk::TextTag, Look)>>,
+    run_tags: RefCell<HashMap<String, gtk::TextTag>>,
+    /// Tables shown in the text: where, what, and the widget showing it —
+    /// built again when the zoom changes.
+    tables: RefCell<Vec<(gtk::TextChildAnchor, Table, gtk::Widget)>>,
+    /// Table cells' shading, as rules for the view's stylesheet.
+    cell_css: RefCell<String>,
+    next_cell: Cell<u32>,
 }
 
 impl Drop for Inner {
@@ -255,8 +286,15 @@ impl DocxView {
             .editable(false)
             .cursor_visible(false)
             .wrap_mode(gtk::WrapMode::WordChar)
-            .pixels_below_lines(6)
             .build();
+        // Sizes in the document are points; the view's own font is the one
+        // they are scaled from.
+        let font = view.pango_context().font_description().unwrap_or_default();
+        let base_pt = match font.size() {
+            0 => 11.0,
+            s if font.is_size_absolute() => s as f64 / gtk::pango::SCALE as f64 * 72.0 / 96.0,
+            s => s as f64 / gtk::pango::SCALE as f64,
+        };
         let buffer = view.buffer();
         make_tags(&buffer);
 
@@ -304,6 +342,12 @@ impl DocxView {
                 zoom: Cell::new(1.0),
                 zoom_css,
                 on_zoom: RefCell::new(None),
+                base_pt,
+                para_tags: RefCell::default(),
+                run_tags: RefCell::default(),
+                tables: RefCell::default(),
+                cell_css: RefCell::default(),
+                next_cell: Cell::new(0),
             }),
         };
         this.fill();
@@ -387,6 +431,10 @@ impl DocxView {
 
     fn fill(&self) {
         let (view, buffer) = (&self.inner.view, &self.inner.buffer);
+        // The fonts the document brought, for it to be shown in.
+        if let Some(map) = view.pango_context().font_map() {
+            crate::fonts::apply(&map);
+        }
         self.inner.quiet.set(true);
         buffer.begin_irreversible_action();
         for (i, item) in self.inner.doc.items.iter().enumerate() {
@@ -398,11 +446,13 @@ impl DocxView {
             let from = buffer.create_mark(None, &start, true);
             for block in &item.blocks {
                 match block {
-                    Block::Paragraph { style, runs, align } => append_paragraph(buffer, *style, runs, *align),
-                    Block::Table { rows } => {
+                    Block::Paragraph { style, runs, look, .. } => self.append_paragraph(*style, runs, look),
+                    Block::Table(t) => {
                         let mut end = buffer.end_iter();
                         let anchor = buffer.create_child_anchor(&mut end);
-                        view.add_child_at_anchor(&table(rows), &anchor);
+                        let widget = self.table_widget(t);
+                        view.add_child_at_anchor(&widget, &anchor);
+                        self.inner.tables.borrow_mut().push((anchor, (**t).clone(), widget));
                         buffer.insert(&mut buffer.end_iter(), "\n");
                     }
                 }
@@ -422,6 +472,320 @@ impl DocxView {
         buffer.set_modified(false);
         buffer.place_cursor(&buffer.start_iter());
         self.inner.quiet.set(false);
+        self.load_css();
+    }
+
+    // ── How the document looks ──────────────────────────────────────────
+
+    /// The tag showing a paragraph's look: its font, spacing, indents and
+    /// alignment. Paragraphs that look alike share one.
+    fn para_tag(&self, look: &Look) -> gtk::TextTag {
+        let key = format!(
+            "{:?}{:?}",
+            (&look.run.font, look.run.size, look.run.bold, look.run.italic, look.run.color, look.align, look.shading),
+            (look.before, look.after, look.left, look.right, look.first, look.line, look.label.is_some())
+        );
+        if let Some((tag, _)) = self.inner.para_tags.borrow().get(&key) {
+            return tag.clone();
+        }
+        let tag = gtk::TextTag::new(Some(&format!("para-{}", self.inner.para_tags.borrow().len())));
+        tag.set_family(Some(&render::family(&look.run.font)));
+        tag.set_scale(look.run.size / self.inner.base_pt);
+        tag.set_weight(if look.run.bold { 700 } else { 400 });
+        tag.set_style(if look.run.italic { gtk::pango::Style::Italic } else { gtk::pango::Style::Normal });
+        tag.set_foreground_rgba(Some(&rgba(look.run.color.unwrap_or(INK))));
+        tag.set_justification(match look.align {
+            docx::Align::Center => gtk::Justification::Center,
+            docx::Align::End => gtk::Justification::Right,
+            docx::Align::Justify => gtk::Justification::Fill,
+            docx::Align::Start => gtk::Justification::Left,
+        });
+        if let Some(shade) = look.shading {
+            tag.set_paragraph_background_rgba(Some(&rgba(shade)));
+        }
+        self.space(&tag, look);
+        self.inner.buffer.tag_table().add(&tag);
+        tag.set_priority(0);
+        self.inner.para_tags.borrow_mut().insert(key, (tag.clone(), look.clone()));
+        tag
+    }
+
+    /// A paragraph tag's spacing and indents, in pixels at the zoom.
+    fn space(&self, tag: &gtk::TextTag, look: &Look) {
+        let px = |pt: f64| (pt * 96.0 / 72.0 * self.zoom()).round() as i32;
+        tag.set_pixels_above_lines(px(look.before));
+        tag.set_pixels_below_lines(px(look.after));
+        let left = px(look.left);
+        let first = px(look.first).max(-left);
+        tag.set_left_margin(left.max(0));
+        tag.set_right_margin(px(look.right).max(0));
+        tag.set_indent(first);
+        // A list number hangs in front: a tab takes the text on to where
+        // the paragraph's other lines start.
+        if look.label.is_some() && first < 0 {
+            let mut tabs = gtk::pango::TabArray::new(1, true);
+            tabs.set_tab(0, gtk::pango::TabAlign::Left, -first);
+            tag.set_tabs(Some(&tabs));
+        }
+        let natural = look.run.size * 1.17;
+        let line = match look.line {
+            Line::Auto(m) => m,
+            Line::Exact(pt) => pt / natural,
+            Line::AtLeast(pt) => (pt / natural).max(1.0),
+        };
+        if (line - 1.0).abs() > 0.02 {
+            tag.set_line_height(line.clamp(0.5, 4.0) as f32);
+        }
+    }
+
+    /// The tag showing what sets a run apart from its paragraph — beyond
+    /// bold, italic, underline and highlight, which have tags of their own.
+    fn run_tag(&self, para: &Look, run: &Run) -> Option<gtk::TextTag> {
+        let rl = render::run_look(run, para);
+        let base = &para.run;
+        // Emphasis the run has from a character style, not from itself.
+        let bold = rl.bold && !run.bold && !base.bold;
+        let italic = rl.italic && !run.italic && !base.italic;
+        let underline = rl.underline && !run.underline;
+        let highlight = rl.highlight.filter(|_| !run.highlight);
+        let font = (rl.font != base.font).then(|| rl.font.clone());
+        let size = (rl.size != base.size || rl.vert != Vert::Baseline).then_some(rl.size);
+        let color = (rl.color != base.color).then_some(rl.color);
+        if !(bold || italic || underline || rl.strike || rl.caps || rl.small_caps || highlight.is_some() || font.is_some() || size.is_some() || color.is_some()) {
+            return None;
+        }
+        let key = format!("{:?}", (bold, italic, underline, rl.strike, rl.caps, rl.small_caps, highlight, &font, size, base.size, rl.vert, color));
+        if let Some(tag) = self.inner.run_tags.borrow().get(&key) {
+            return Some(tag.clone());
+        }
+        let tag = gtk::TextTag::new(Some(&format!("run-{}", self.inner.run_tags.borrow().len())));
+        if bold {
+            tag.set_weight(700);
+        }
+        if italic {
+            tag.set_style(gtk::pango::Style::Italic);
+        }
+        if underline {
+            tag.set_underline(gtk::pango::Underline::Single);
+        }
+        tag.set_strikethrough(rl.strike);
+        if rl.small_caps {
+            tag.set_variant(gtk::pango::Variant::SmallCaps);
+        } else if rl.caps {
+            tag.set_variant(gtk::pango::Variant::AllSmallCaps);
+        }
+        if let Some(h) = highlight {
+            tag.set_background_rgba(Some(&rgba(h)));
+        }
+        if let Some(f) = &font {
+            tag.set_family(Some(&render::family(f)));
+        }
+        if let Some(size) = size {
+            // Tags' scales multiply: the paragraph's is already applied.
+            let shown = if rl.vert == Vert::Baseline { size } else { size * 0.65 };
+            tag.set_scale(shown / base.size.max(1.0));
+            let px = size * 96.0 / 72.0 * gtk::pango::SCALE as f64;
+            match rl.vert {
+                Vert::Super => tag.set_rise((px * 0.33) as i32),
+                Vert::Sub => tag.set_rise((-px * 0.14) as i32),
+                Vert::Baseline => {}
+            }
+        }
+        if let Some(c) = color {
+            tag.set_foreground_rgba(Some(&rgba(c.unwrap_or(INK))));
+        }
+        self.inner.buffer.tag_table().add(&tag);
+        tag.set_priority(self.inner.buffer.tag_table().size() - 1);
+        self.inner.run_tags.borrow_mut().insert(key, tag.clone());
+        Some(tag)
+    }
+
+    fn append_paragraph(&self, style: ParaStyle, runs: &[Run], look: &Look) {
+        let buffer = &self.inner.buffer;
+        let start = buffer.create_mark(None, &buffer.end_iter(), true);
+        if let Some((label, label_look)) = &look.label {
+            let mut tags = vec![buffer.tag_table().lookup(BULLET_TAG).unwrap_or_default()];
+            let label_run = Run { look: Some(std::sync::Arc::new(label_look.clone())), ..Default::default() };
+            tags.extend(self.run_tag(look, &label_run));
+            let refs: Vec<&gtk::TextTag> = tags.iter().collect();
+            buffer.insert_with_tags(&mut buffer.end_iter(), &format!("{label}\t"), &refs);
+        } else if let ParaStyle::ListItem(level) = style {
+            buffer.insert_with_tags_by_name(&mut buffer.end_iter(), bullet_text(level), &[BULLET_TAG]);
+        }
+        for run in runs {
+            if let Some(image) = &run.image {
+                let picture = Picture::new(image.clone());
+                picture.set_zoom(self.zoom());
+                buffer.insert_paintable(&mut buffer.end_iter(), &picture);
+                continue;
+            }
+            if let Some(markup) = &run.math {
+                // Equations are shown, not edited: they are kept as they were.
+                buffer.insert_markup(&mut buffer.end_iter(), markup);
+                continue;
+            }
+            let mut tags: Vec<gtk::TextTag> = Vec::new();
+            let table = buffer.tag_table();
+            for (on, name) in [(run.bold, "bold"), (run.italic, "italic"), (run.underline, "underline"), (run.highlight, "highlight"), (run.placeholder, PLACEHOLDER_TAG)] {
+                if on && let Some(t) = table.lookup(name) {
+                    tags.push(t);
+                }
+            }
+            tags.extend(self.run_tag(look, run));
+            let refs: Vec<&gtk::TextTag> = tags.iter().collect();
+            let text = run.text.replace('\n', &LINE_BREAK.to_string());
+            buffer.insert_with_tags(&mut buffer.end_iter(), &text, &refs);
+        }
+        buffer.insert(&mut buffer.end_iter(), "\n");
+        let (s, e) = (buffer.iter_at_mark(&start), buffer.end_iter());
+        buffer.apply_tag_by_name(&block_tag(style), &s, &e);
+        buffer.apply_tag(&self.para_tag(look), &s, &e);
+        buffer.delete_mark(&start);
+    }
+
+    /// A table: a grid of cells, each with its paragraphs (formatted, as
+    /// labels), pictures and tables, at the table's column widths.
+    fn table_widget(&self, t: &Table) -> gtk::Widget {
+        let zoom = self.zoom();
+        let px = |pt: f64| pt * 96.0 / 72.0 * zoom;
+        let available = px(self.inner.doc.page.width - self.inner.doc.page.margins[1] - self.inner.doc.page.margins[3]);
+        let cols = t.columns().max(1);
+        let widths: Vec<f64> = if t.widths.len() == cols && t.widths.iter().sum::<f64>() > 1.0 {
+            let total: f64 = t.widths.iter().map(|w| px(*w)).sum();
+            let k = (available / total).min(1.0);
+            t.widths.iter().map(|w| px(*w) * k).collect()
+        } else {
+            vec![available / cols as f64; cols]
+        };
+        let grid = gtk::Grid::builder().css_classes(["docx-table"]).margin_top(4).margin_bottom(8).build();
+        if t.borders {
+            grid.add_css_class("bordered");
+        }
+        for (r, row) in t.rows.iter().enumerate() {
+            let mut col = 0usize;
+            for cell in row {
+                let span = cell.span.max(1);
+                let width: f64 = widths.iter().skip(col).take(span).sum();
+                let cell_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(2)
+                    .css_classes(["docx-cell"])
+                    .width_request(width.max(16.0) as i32)
+                    .build();
+                if let Some([red, g, b]) = cell.shade {
+                    let n = self.inner.next_cell.get();
+                    self.inner.next_cell.set(n + 1);
+                    let name = format!("{}-cell-{n}", self.inner.view.widget_name());
+                    cell_box.set_widget_name(&name);
+                    self.inner.cell_css.borrow_mut().push_str(&format!("#{name} {{ background-color: #{red:02X}{g:02X}{b:02X}; }}\n"));
+                }
+                if !cell.merged {
+                    self.fill_box(&cell_box, &cell.blocks, width - 12.0);
+                }
+                grid.attach(&cell_box, col as i32, r as i32, span as i32, 1);
+                col += span;
+            }
+        }
+        grid.upcast()
+    }
+
+    /// The content of a table cell: labels for paragraphs, pictures, tables.
+    fn fill_box(&self, into: &gtk::Box, blocks: &[Block], width: f64) {
+        let zoom = self.zoom();
+        for block in blocks {
+            match block {
+                Block::Paragraph { style, runs, look, .. } => {
+                    let look = render::effective(look, *style, &self.inner.doc.page);
+                    let text_runs: Vec<&Run> = runs.iter().filter(|r| r.image.is_none()).collect();
+                    for image in runs.iter().filter_map(|r| r.image.as_ref()) {
+                        let picture = Picture::new(image.clone());
+                        picture.set_zoom(zoom);
+                        let widget = gtk::Picture::builder().paintable(&picture).can_shrink(true).halign(gtk::Align::Start).build();
+                        widget.set_size_request(picture.intrinsic_width().min(width as i32), picture.intrinsic_height());
+                        into.append(&widget);
+                    }
+                    let (mut text, attrs) = render::attributed(&look, &text_runs, &|_| String::new());
+                    if text.is_empty() && runs.iter().any(|r| r.image.is_some()) {
+                        continue;
+                    }
+                    let all = pango_all(&attrs, &look.run, zoom);
+                    if let Some((label, _)) = &look.label {
+                        text = format!("{label}  {text}");
+                        let shift = (label.len() + 2) as u32;
+                        let shifted = gtk::pango::AttrList::new();
+                        for mut a in all.attributes() {
+                            let (s, e) = (a.start_index(), a.end_index());
+                            if s > 0 || e != u32::MAX {
+                                a.set_start_index(s + shift);
+                                a.set_end_index(e.saturating_add(shift));
+                            }
+                            shifted.insert(a);
+                        }
+                        let label_widget = self.cell_label(&text, &shifted, &look, width);
+                        into.append(&label_widget);
+                    } else {
+                        into.append(&self.cell_label(&text, &all, &look, width));
+                    }
+                }
+                Block::Table(t) => into.append(&self.table_widget(t)),
+            }
+        }
+    }
+
+    fn cell_label(&self, text: &str, attrs: &gtk::pango::AttrList, look: &Look, width: f64) -> gtk::Label {
+        let label = gtk::Label::builder()
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .selectable(true)
+            .xalign(match look.align {
+                docx::Align::Center => 0.5,
+                docx::Align::End => 1.0,
+                _ => 0.0,
+            })
+            .justify(match look.align {
+                docx::Align::Center => gtk::Justification::Center,
+                docx::Align::End => gtk::Justification::Right,
+                _ => gtk::Justification::Left,
+            })
+            .css_classes(["docx-cell-text"])
+            .build();
+        label.set_text(text);
+        label.set_attributes(Some(attrs));
+        label.set_size_request((width - look.left).max(8.0) as i32, -1);
+        label.set_margin_start((look.left * 96.0 / 72.0 * self.zoom()) as i32);
+        label
+    }
+
+    /// The view's stylesheet: its text size for the zoom, its cells' shading.
+    fn load_css(&self) {
+        let name = self.inner.view.widget_name();
+        let css = format!("textview#{name} {{ font-size: {:.1}%; }}\n{}", self.zoom() * 100.0, self.inner.cell_css.borrow());
+        self.inner.zoom_css.load_from_string(&css);
+    }
+
+    /// Show the sheet as white paper, or turned dark for reading at night.
+    pub fn set_dark_pages(&self, on: bool) {
+        if on {
+            self.inner.sheet.add_css_class("dark-page");
+        } else {
+            self.inner.sheet.remove_css_class("dark-page");
+        }
+    }
+
+    pub fn sections(&self) -> Vec<docx::Section> {
+        self.inner.doc.sections.clone()
+    }
+
+    fn clear_para_look(&self, from: &gtk::TextIter, to: &gtk::TextIter) {
+        let names: Vec<String> = self.inner.para_tags.borrow().values().filter_map(|(t, _)| t.name().map(|n| n.to_string())).collect();
+        for name in names {
+            self.inner.buffer.remove_tag_by_name(&name, from, to);
+        }
+    }
+
+    fn set_para_look(&self, from: &gtk::TextIter, to: &gtk::TextIter, look: &Look) {
+        self.clear_para_look(from, to);
+        self.inner.buffer.apply_tag(&self.para_tag(look), from, to);
     }
 
     // ── Reading the buffer back ─────────────────────────────────────────
@@ -471,8 +835,12 @@ impl DocxView {
         let mut out = Vec::new();
         let mut claimed: Option<usize> = None;
         let mut last_locked: Option<usize> = None;
+        // The list item a new item follows: it carries on that list.
+        let mut list: Option<usize> = None;
         for (at, line) in lines.iter().enumerate() {
+            let in_list = matches!(line.style, ParaStyle::ListItem(_));
             if line.locked {
+                list = None;
                 // A locked item may span several lines; it is written once.
                 if let Some(i) = line.locked_item
                     && last_locked != Some(i)
@@ -485,12 +853,14 @@ impl DocxView {
             last_locked = None;
             if let Some(i) = claimed.take() {
                 out.push(Out::Keep(i));
+                list = in_list.then_some(i);
                 continue;
             }
             let editable: Vec<usize> =
                 line.origins.iter().copied().filter(|&i| doc.items[i].kind == ItemKind::Paragraph).collect();
             if let Some(&i) = editable.iter().find(|&&i| same(line, i)) {
                 out.push(Out::Keep(i));
+                list = in_list.then_some(i);
                 continue;
             }
             // Enter at the start of a paragraph leaves its mark on the new
@@ -505,12 +875,13 @@ impl DocxView {
                 out.push(Out::Para { style: line.style, runs: line.runs.clone(), base: None });
                 continue;
             }
-            let base = editable.last().copied();
+            let base = editable.last().copied().or(if in_list { list } else { None });
             let runs = with_props(&line.runs, base.and_then(|b| match doc.items[b].blocks.first() {
                 Some(Block::Paragraph { runs, .. }) => Some(runs.as_slice()),
                 _ => None,
             }));
             out.push(Out::Para { style: line.style, runs, base });
+            list = if in_list { base } else { None };
         }
         out
     }
@@ -736,6 +1107,14 @@ impl DocxView {
         for name in [LOCKED_TAG, PLACEHOLDER_TAG, BULLET_TAG] {
             buffer.remove_tag_by_name(name, &start, &end);
         }
+        // …and the look of the paragraph and run it went into.
+        let mut probe = start;
+        let neighbour = if !start.starts_line() && probe.backward_char() { probe } else { end };
+        for tag in neighbour.tags() {
+            if tag.name().is_some_and(|n| n.starts_with("para-") || n.starts_with("run-")) {
+                buffer.apply_tag(&tag, &start, &end);
+            }
+        }
         // The paragraph it went into keeps its style, and so does the text
         // that followed the insertion point on to its new line. Lines the
         // insertion created are new paragraphs of the same kind — except
@@ -761,15 +1140,26 @@ impl DocxView {
         // every iterator.
         let (first, last) = (start.line(), end.line());
         let carried = !end.ends_line();
-        // Lines the insertion made are new paragraphs, saved without the
-        // alignment of the one they were split from; shown so too.
+        // Lines the insertion made are new paragraphs, saved with their
+        // kind's style rather than the properties of the one they were
+        // split from; shown so too. A new list item looks like the item it
+        // follows, whose list it carries on.
         if last > first
             && let Some(from) = buffer.iter_at_line(first + 1)
         {
             let mut to = buffer.iter_at_line(last).unwrap_or(buffer.end_iter());
-            to.forward_to_line_end();
-            for name in ALIGN_TAGS {
-                buffer.remove_tag_by_name(name, &from, &to);
+            to.forward_line();
+            let next = match style {
+                ParaStyle::Title | ParaStyle::Heading(_) => ParaStyle::Normal,
+                s => s,
+            };
+            let previous = buffer.iter_at_line(first).and_then(|s| s.tags().into_iter().find(|t| t.name().is_some_and(|n| n.starts_with("para-"))));
+            match (next, previous) {
+                (ParaStyle::ListItem(_), Some(tag)) => {
+                    self.clear_para_look(&from, &to);
+                    buffer.apply_tag(&tag, &from, &to);
+                }
+                _ => self.set_para_look(&from, &to, &self.inner.doc.look_for(next)),
             }
         }
         self.restyle_lines(first, first, style);
@@ -829,10 +1219,16 @@ impl DocxView {
             let start = buffer.iter_at_line(line).unwrap_or(buffer.end_iter());
             let mut end = start;
             end.forward_line();
+            // A paragraph that changes kind takes the look of its new kind;
+            // one that keeps its kind keeps its own (the file's) look.
+            let changed = style_at_line(buffer, line) != style || !has_para_tag(&start);
             for name in BLOCK_TAGS.iter().copied().chain(LIST_TAGS.iter().copied()) {
                 buffer.remove_tag_by_name(name, &start, &end);
             }
             buffer.apply_tag_by_name(&block_tag(style), &start, &end);
+            if changed {
+                self.set_para_look(&start, &end, &self.inner.doc.look_for(style));
+            }
         }
         self.inner.quiet.set(was_quiet);
         self.report_format();
@@ -942,8 +1338,20 @@ impl DocxView {
         let fraction = if vadj.upper() > 0.0 { (vadj.value() + vadj.page_size() / 2.0) / vadj.upper() } else { 0.0 };
 
         self.inner.zoom.set(zoom);
-        let name = self.inner.view.widget_name();
-        self.inner.zoom_css.load_from_string(&format!("textview#{name} {{ font-size: {:.1}%; }}", zoom * 100.0));
+        for (tag, look) in self.inner.para_tags.borrow().values() {
+            self.space(tag, look);
+        }
+        // Tables are built at a size; built again at the new one.
+        self.inner.cell_css.borrow_mut().clear();
+        self.inner.next_cell.set(0);
+        let tables: Vec<(gtk::TextChildAnchor, Table, gtk::Widget)> = self.inner.tables.borrow_mut().drain(..).collect();
+        for (anchor, table, old) in tables {
+            self.inner.view.remove(&old);
+            let widget = self.table_widget(&table);
+            self.inner.view.add_child_at_anchor(&widget, &anchor);
+            self.inner.tables.borrow_mut().push((anchor, table, widget));
+        }
+        self.load_css();
         let inner = &self.inner;
         inner.clamp.set_maximum_size((SHEET_WIDTH * zoom).round() as i32);
         inner.clamp.set_tightening_threshold((SHEET_TIGHTENING * zoom).round() as i32);
@@ -1041,10 +1449,37 @@ fn item_of_lock(tag: &str) -> Option<usize> {
     tag.strip_prefix("lock-")?.parse().ok()
 }
 
+/// Which kind of paragraph a line is: markers only — how it looks is in
+/// its look tag.
 const BLOCK_TAGS: [&str; 9] = ["title", "h1", "h2", "h3", "h4", "h5", "h6", "body", "quote"];
-/// How a paragraph read from the file is aligned. Shown, not edited: an
-/// edited paragraph keeps its alignment in the file, and a new one has none.
-const ALIGN_TAGS: [&str; 3] = ["align-center", "align-end", "align-justify"];
+
+/// Text on the paper: near-black.
+const INK: [u8; 3] = [0x1B, 0x1B, 0x1F];
+
+fn rgba([r, g, b]: [u8; 3]) -> gdk::RGBA {
+    gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+}
+
+fn has_para_tag(at: &gtk::TextIter) -> bool {
+    at.tags().iter().any(|t| t.name().is_some_and(|n| n.starts_with("para-")))
+}
+
+/// A cell paragraph's attributes over its font, at the zoom.
+fn pango_all(attrs: &gtk::pango::AttrList, base: &RunLook, zoom: f64) -> gtk::pango::AttrList {
+    let all = gtk::pango::AttrList::new();
+    let mut desc = gtk::pango::AttrFontDesc::new(&render::description(base));
+    desc.set_start_index(0);
+    desc.set_end_index(u32::MAX);
+    all.insert(desc);
+    let mut scale = gtk::pango::AttrFloat::new_scale(zoom);
+    scale.set_start_index(0);
+    scale.set_end_index(u32::MAX);
+    all.insert(scale);
+    for a in attrs.attributes() {
+        all.insert(a);
+    }
+    all
+}
 const LIST_TAGS: [&str; 6] = ["list0", "list1", "list2", "list3", "list4", "list5"];
 
 fn block_tag(style: ParaStyle) -> String {
@@ -1201,120 +1636,21 @@ fn make_tags(buffer: &gtk::TextBuffer) {
         f(&t);
         tags.add(&t);
     };
-    tag("title", &|t| {
-        t.set_scale(2.0);
-        t.set_weight(800);
-        t.set_pixels_below_lines(18);
-    });
-    for level in 1..=6u8 {
-        let scale = [1.6, 1.35, 1.18, 1.08, 1.0, 1.0][level as usize - 1];
-        tag(&format!("h{level}"), &|t| {
-            t.set_scale(scale);
-            t.set_weight(700);
-            t.set_pixels_above_lines(14);
-            t.set_pixels_below_lines(6);
-        });
+    for name in BLOCK_TAGS.iter().chain(LIST_TAGS.iter()) {
+        tag(name, &|_| {});
     }
-    tag("body", &|t| t.set_scale(1.05));
     tag("bold", &|t| t.set_weight(700));
     tag("italic", &|t| t.set_style(gtk::pango::Style::Italic));
     tag("underline", &|t| t.set_underline(gtk::pango::Underline::Single));
     tag("highlight", &|t| {
-        t.set_background_rgba(Some(&gdk::RGBA::new(1.0, 0.86, 0.2, 0.55)));
+        t.set_background_rgba(Some(&gdk::RGBA::new(1.0, 0.92, 0.0, 1.0)));
     });
-    tag("quote", &|t| {
-        t.set_style(gtk::pango::Style::Italic);
-        t.set_left_margin(28);
-        t.set_foreground_rgba(Some(&gdk::RGBA::new(0.6, 0.62, 0.7, 1.0)));
-    });
-    for level in 0..6 {
-        tag(&format!("list{level}"), &|t| {
-            t.set_left_margin(18 + 22 * level);
-            t.set_indent(-16);
-        });
-    }
-    for (name, how) in ALIGN_TAGS.iter().zip([gtk::Justification::Center, gtk::Justification::Right, gtk::Justification::Fill]) {
-        tag(name, &|t| t.set_justification(how));
-    }
     tag(BULLET_TAG, &|t| t.set_editable(false));
     tag(LOCKED_TAG, &|t| t.set_editable(false));
     tag(PLACEHOLDER_TAG, &|t| {
         t.set_style(gtk::pango::Style::Italic);
-        t.set_foreground_rgba(Some(&gdk::RGBA::new(0.55, 0.57, 0.65, 1.0)));
+        t.set_foreground_rgba(Some(&gdk::RGBA::new(0.45, 0.47, 0.55, 1.0)));
     });
-}
-
-fn append_paragraph(buffer: &gtk::TextBuffer, style: ParaStyle, runs: &[Run], align: Align) {
-    let start = buffer.create_mark(None, &buffer.end_iter(), true);
-    if let ParaStyle::ListItem(level) = style {
-        buffer.insert_with_tags_by_name(&mut buffer.end_iter(), bullet_text(level), &[BULLET_TAG]);
-    }
-    for run in runs {
-        if let Some(image) = &run.image {
-            buffer.insert_paintable(&mut buffer.end_iter(), &Picture::new(image.clone()));
-            continue;
-        }
-        let mut names: Vec<&str> = Vec::new();
-        if run.bold {
-            names.push("bold");
-        }
-        if run.italic {
-            names.push("italic");
-        }
-        if run.underline {
-            names.push("underline");
-        }
-        if run.highlight {
-            names.push("highlight");
-        }
-        if run.placeholder {
-            names.push(PLACEHOLDER_TAG);
-        }
-        let text = run.text.replace('\n', &LINE_BREAK.to_string());
-        buffer.insert_with_tags_by_name(&mut buffer.end_iter(), &text, &names);
-    }
-    buffer.insert(&mut buffer.end_iter(), "\n");
-    let (s, e) = (buffer.iter_at_mark(&start), buffer.end_iter());
-    buffer.apply_tag_by_name(&block_tag(style), &s, &e);
-    let align = match align {
-        Align::Start => None,
-        Align::Center => Some(ALIGN_TAGS[0]),
-        Align::End => Some(ALIGN_TAGS[1]),
-        Align::Justify => Some(ALIGN_TAGS[2]),
-    };
-    if let Some(tag) = align {
-        buffer.apply_tag_by_name(tag, &s, &e);
-    }
-    buffer.delete_mark(&start);
-}
-
-fn table(rows: &[Vec<String>]) -> gtk::Widget {
-    let grid = gtk::Grid::builder()
-        .column_spacing(0)
-        .row_spacing(0)
-        .css_classes(["card"])
-        .margin_top(6)
-        .margin_bottom(6)
-        .build();
-    for (r, row) in rows.iter().enumerate() {
-        for (c, cell) in row.iter().enumerate() {
-            let label = gtk::Label::builder()
-                .label(cell)
-                .wrap(true)
-                .xalign(0.0)
-                .selectable(true)
-                .margin_start(8)
-                .margin_end(8)
-                .margin_top(4)
-                .margin_bottom(4)
-                .build();
-            if r == 0 {
-                label.add_css_class("heading");
-            }
-            grid.attach(&label, c as i32, r as i32, 1, 1);
-        }
-    }
-    grid.upcast()
 }
 
 #[cfg(test)]
@@ -1408,13 +1744,14 @@ mod tests {
 
     fn editing_round_trip() {
         let body = r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Title here</w:t></w:r></w:p><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>First para</w:t></w:r></w:p><w:p><w:r><w:drawing/></w:r><w:r><w:t>With image</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="3"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p><w:p><w:r><w:t>Last</w:t></w:r></w:p>"#;
-        let doc = crate::docx::load(&package(body, &[])).unwrap();
+        let numbering = r#"<?xml version="1.0"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum><w:num w:numId="3"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+        let doc = crate::docx::load(&package(body, &[("word/numbering.xml", numbering)])).unwrap();
         let view = DocxView::new(doc);
         let buffer = view.buffer().clone();
 
         // Untouched: every paragraph kept as it was.
         assert_eq!(view.to_out(), vec![Out::Keep(0), Out::Keep(1), Out::Keep(2), Out::Keep(3), Out::Keep(4)]);
-        assert!(buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).contains("•  Item"));
+        assert!(buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).contains("•\tItem"));
 
         view.set_editable(true);
         // Type at the end of "First para".
@@ -1453,7 +1790,8 @@ mod tests {
         assert_eq!(out[3], Out::Keep(2), "the image paragraph is kept verbatim");
         assert_eq!(out[4], Out::Keep(3));
         let Out::Para { style, runs, base } = &out[5] else { panic!("{:?}", out[5]) };
-        assert_eq!((*style, runs[0].text.as_str(), *base), (ParaStyle::ListItem(0), "Second item", None));
+        // A new item carries on the list of the item it follows.
+        assert_eq!((*style, runs[0].text.as_str(), *base), (ParaStyle::ListItem(0), "Second item", Some(3)));
         let Out::Para { runs, .. } = &out[6] else { panic!("{:?}", out[6]) };
         assert!(runs[0].bold && runs[0].text == "Last");
 

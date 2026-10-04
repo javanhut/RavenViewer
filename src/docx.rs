@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
+
+use crate::look::{self, Counters, Look, RunLook, Sheet};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
@@ -34,15 +36,57 @@ pub struct Run {
     pub placeholder: bool,
     /// A picture: the run's text is then a single U+FFFC.
     pub image: Option<Image>,
+    /// An equation, as Pango markup (the text is the same, plain); shown,
+    /// and kept as it was in the file.
+    pub math: Option<String>,
+    /// A page number (or the page count) where the document asks for one —
+    /// in a header or footer.
+    pub field: Option<Field>,
+    /// A drawn shape or text box; shown, and kept as it was in the file.
+    pub shape: Option<Arc<Shape>>,
+    /// A reference to a footnote or an endnote: the run's text is its
+    /// number, and the note is set at the foot of the page or the end.
+    pub note: Option<Arc<Note>>,
     /// The run's other properties (font, size, colour…) as XML, kept so an
     /// edited paragraph does not lose its typeface.
     pub props: String,
+    /// How the run looks once the document's styles are applied; for
+    /// showing it, never saved.
+    pub look: Option<Arc<RunLook>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Page,
+    Pages,
+    /// A note's own number, in front of its text; numbered as the document
+    /// is read.
+    NoteMark,
+}
+
+/// A footnote or an endnote.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Note {
+    /// A footnote, at the foot of the page; else an endnote.
+    pub foot: bool,
+    pub id: String,
+    /// The reference is marked by the text after it, not numbered.
+    pub custom: bool,
+    pub blocks: Vec<Block>,
 }
 
 impl Run {
     fn same_format(&self, other: &Run) -> bool {
         self.image.is_none()
             && other.image.is_none()
+            && self.math.is_none()
+            && other.math.is_none()
+            && self.field.is_none()
+            && other.field.is_none()
+            && self.note.is_none()
+            && other.note.is_none()
+            && self.shape.is_none()
+            && other.shape.is_none()
             && (self.bold, self.italic, self.underline, self.highlight, self.placeholder)
                 == (other.bold, other.italic, other.underline, other.highlight, other.placeholder)
     }
@@ -80,6 +124,57 @@ pub struct Image {
     pub cy: i64,
     /// Where it was read from; `None` for a picture added here.
     pub origin: Option<Arc<Origin>>,
+    /// Where it floats, for a picture placed on the page rather than in
+    /// the text.
+    pub anchor: Option<Anchor>,
+}
+
+/// A shape drawn in the document — a rectangle, an ellipse, a line — and
+/// the text in it, for a text box.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shape {
+    /// The preset geometry: `rect`, `roundRect`, `ellipse`, `line`…
+    pub geom: String,
+    pub fill: Option<[u8; 3]>,
+    /// The outline's colour and width (points).
+    pub line: Option<([u8; 3], f64)>,
+    /// Size in EMU.
+    pub cx: i64,
+    pub cy: i64,
+    pub anchor: Option<Anchor>,
+    pub text: Vec<Block>,
+    /// Space round the text inside: top, right, bottom, left, in points.
+    pub insets: [f64; 4],
+    pub valign: VAlign,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VAlign {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
+/// Where a floating picture sits: across and down, each from something.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Anchor {
+    pub h: Place,
+    pub v: Place,
+    /// Drawn behind the text.
+    pub behind: bool,
+    /// Text keeps clear of it (rather than running under or over it).
+    pub wrap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Place {
+    /// `page`, `margin`, `column`, `paragraph`…
+    pub from: String,
+    /// Points from there.
+    pub offset: f64,
+    /// `left`, `center`, `right`, `top`, `bottom`, instead of an offset.
+    pub align: Option<String>,
 }
 
 /// A picture as the document had it.
@@ -112,7 +207,7 @@ impl Image {
             cy = cy * max_width / cx;
             cx = max_width;
         }
-        Image { data: Arc::new(data), cx, cy, origin: None }
+        Image { data: Arc::new(data), cx, cy, origin: None, anchor: None }
     }
 }
 
@@ -145,15 +240,6 @@ pub enum Align {
 }
 
 impl Align {
-    fn from_jc(v: &str) -> Align {
-        match v {
-            "center" => Align::Center,
-            "right" | "end" => Align::End,
-            "both" | "distribute" => Align::Justify,
-            _ => Align::Start,
-        }
-    }
-
     fn jc(self) -> Option<&'static str> {
         match self {
             Align::Start => None,
@@ -179,6 +265,10 @@ pub struct PageSetup {
     pub after: f64,
     /// Line height as a multiple of single spacing.
     pub line: f64,
+    /// How far the header and the footer sit from the paper's edge, in
+    /// points.
+    pub header: f64,
+    pub footer: f64,
 }
 
 impl Default for PageSetup {
@@ -191,6 +281,8 @@ impl Default for PageSetup {
             size: 11.0,
             after: 8.0,
             line: 1.08,
+            header: 36.0,
+            footer: 36.0,
         }
     }
 }
@@ -214,13 +306,143 @@ pub enum ParaStyle {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
-    Paragraph { style: ParaStyle, runs: Vec<Run>, align: Align },
-    Table { rows: Vec<Vec<String>> },
+    /// `look` is how it is set, from the document's styles: worked out when
+    /// the document is read, and again for the paragraphs an edit made.
+    Paragraph { style: ParaStyle, runs: Vec<Run>, align: Align, look: Arc<Look> },
+    Table(Box<Table>),
 }
 
 impl Block {
     pub fn paragraph(style: ParaStyle, runs: Vec<Run>) -> Block {
-        Block::Paragraph { style, runs, align: Align::Start }
+        Block::Paragraph { style, runs, align: Align::Start, look: Arc::default() }
+    }
+}
+
+/// A table: rows of cells, each holding paragraphs (and tables) of its own.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Table {
+    pub rows: Vec<Vec<Cell>>,
+    /// The columns' widths, in points.
+    pub widths: Vec<f64>,
+    /// Lines between the cells and round the table.
+    pub borders: bool,
+    /// Which lines, as the table and its style say.
+    pub edges: look::Borders,
+    /// How wide it is meant to be: a share of the text width, or points.
+    pub width: Option<TableWidth>,
+    /// Cells' margins: top, right, bottom, left, in points.
+    pub pad: [f64; 4],
+    /// Each row's height, as it asks: at least (or exactly) this many
+    /// points.
+    pub heights: Vec<Option<(f64, bool)>>,
+    /// Its style, and the lines and margins it sets itself, for working out
+    /// `edges` and `pad` with the document's styles.
+    pub style_id: Option<String>,
+    pub direct_edges: HashMap<String, Option<look::Edge>>,
+    pub direct_pad: [Option<f64>; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TableWidth {
+    /// A share of the text width, 1.0 being all of it.
+    Share(f64),
+    Points(f64),
+}
+
+/// Word's own cell margins, where nothing says.
+pub const CELL_PAD: [f64; 4] = [0.0, 5.4, 0.0, 5.4];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cell {
+    pub blocks: Vec<Block>,
+    /// How many columns it spans.
+    pub span: usize,
+    pub shade: Option<[u8; 3]>,
+    /// The cell continues the one above it (merged down); its own content
+    /// is not shown.
+    pub merged: bool,
+    /// Lines the cell sets for itself, by edge (`top`, `left`…): a line,
+    /// "none", or left to the table.
+    pub edges: HashMap<String, Option<look::Edge>>,
+    pub valign: VAlign,
+    /// Margins the cell sets for itself, over the table's.
+    pub pad: [Option<f64>; 4],
+}
+
+impl Cell {
+    pub fn text(&self) -> String {
+        text_of(&self.blocks).trim_end_matches('\n').to_string()
+    }
+}
+
+impl Table {
+    /// A plain table of text, a paragraph per line of each cell.
+    pub fn of_text(rows: Vec<Vec<String>>) -> Table {
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|text| Cell {
+                        blocks: text
+                            .split('\n')
+                            .map(|line| {
+                                let runs = if line.is_empty() { vec![] } else { vec![Run { text: line.into(), ..Default::default() }] };
+                                Block::paragraph(ParaStyle::Normal, runs)
+                            })
+                            .collect(),
+                        span: 1,
+                        shade: None,
+                        merged: false,
+                        edges: HashMap::new(),
+                        valign: VAlign::Top,
+                        pad: [None; 4],
+                    })
+                    .collect()
+            })
+            .collect();
+        let line = Some(look::Edge { color: [0, 0, 0], width: 0.5 });
+        let edges = look::Borders { top: line, left: line, bottom: line, right: line, inside_h: line, inside_v: line };
+        Table { rows, borders: true, edges, pad: CELL_PAD, ..Default::default() }
+    }
+
+    /// A cell's margins: its own, else the table's.
+    pub fn pad_of(&self, cell: &Cell) -> [f64; 4] {
+        let mut pad = self.pad;
+        for (i, v) in cell.pad.iter().enumerate() {
+            if let Some(v) = v {
+                pad[i] = *v;
+            }
+        }
+        pad
+    }
+
+    /// The line on one edge of the cell at row `r`, columns `c..c+span`.
+    pub fn edge(&self, cell: &Cell, side: &str, r: usize, c: usize, span: usize) -> Option<look::Edge> {
+        if let Some(own) = cell.edges.get(side) {
+            return *own;
+        }
+        let cols = self.columns();
+        match side {
+            "top" if r == 0 => self.edges.top,
+            "top" => self.edges.inside_h,
+            "bottom" if r + 1 == self.rows.len() => self.edges.bottom,
+            "bottom" => self.edges.inside_h,
+            "left" if c == 0 => self.edges.left,
+            "left" => self.edges.inside_v,
+            "right" if c + span >= cols => self.edges.right,
+            "right" => self.edges.inside_v,
+            _ => None,
+        }
+    }
+
+    /// Each cell's text, row by row.
+    pub fn text_rows(&self) -> Vec<Vec<String>> {
+        self.rows.iter().map(|r| r.iter().map(Cell::text).collect()).collect()
+    }
+
+    /// The number of columns, spans counted.
+    pub fn columns(&self) -> usize {
+        self.rows.iter().map(|r| r.iter().map(|c| c.span.max(1)).sum::<usize>()).max().unwrap_or(0).max(self.widths.len())
     }
 }
 
@@ -266,6 +488,54 @@ pub struct Docx {
     /// A list paragraph's numbering, reused for new bullets.
     bullet: Option<String>,
     pub page: PageSetup,
+    /// How the document looks: its styles, theme fonts and lists.
+    pub sheet: Sheet,
+    /// Its sections, in order: each one's paper, margins, headers and
+    /// footers. The paragraph ending each but the last says so in its look.
+    pub sections: Vec<Section>,
+}
+
+/// A stretch of the document set on paper of its own, with headers and
+/// footers of its own.
+#[derive(Debug, Clone, Default)]
+pub struct Section {
+    pub page: PageSetup,
+    pub decor: Decor,
+    /// It carries on on the same page as the section before it.
+    pub continuous: bool,
+    /// Its pages are numbered from this.
+    pub restart: Option<i32>,
+}
+
+/// What goes at the top and the bottom of every page.
+#[derive(Debug, Clone, Default)]
+pub struct Decor {
+    pub header: Vec<Block>,
+    pub footer: Vec<Block>,
+    /// The first page's own, when it has them.
+    pub first_header: Option<Vec<Block>>,
+    pub first_footer: Option<Vec<Block>>,
+}
+
+impl Decor {
+    /// The header and footer of a page: the first of its section, or not.
+    pub fn of_page(&self, first: bool) -> (&[Block], &[Block]) {
+        match (first, &self.first_header, &self.first_footer) {
+            (true, Some(h), Some(f)) => (h, f),
+            _ => (&self.header, &self.footer),
+        }
+    }
+
+    /// Whether anything in them counts the pages.
+    pub fn counts_pages(&self) -> bool {
+        fn any(blocks: &[Block]) -> bool {
+            blocks.iter().any(|b| match b {
+                Block::Paragraph { runs, .. } => runs.iter().any(|r| r.field == Some(Field::Pages)),
+                Block::Table(t) => t.rows.iter().flatten().any(|c| any(&c.blocks)),
+            })
+        }
+        any(&self.header) || any(&self.footer) || self.first_header.as_deref().is_some_and(any) || self.first_footer.as_deref().is_some_and(any)
+    }
 }
 
 /// What to write for one paragraph of the edited document.
@@ -287,49 +557,315 @@ pub fn load(bytes: &[u8]) -> Result<Docx> {
     let xml = read_part(&mut zip, "word/document.xml")?.context("the file has no word/document.xml")?;
     let styles_xml = read_part(&mut zip, "word/styles.xml")?;
     let styles = styles_xml.as_deref().map(style_ids).unwrap_or_default();
+    let numbering_xml = read_part(&mut zip, "word/numbering.xml").ok().flatten();
+    let rels = read_part(&mut zip, &rels_path("word/document.xml"))?.map(|x| rels_of(&x)).unwrap_or_default();
+    let theme = rels.iter().find(|r| r.kind.ends_with("/theme") && !r.external).map(|r| resolve("word", &r.target));
+    let theme_xml = theme.and_then(|t| read_part(&mut zip, &t).ok().flatten());
+    let sheet = Sheet::load(styles_xml.as_deref(), numbering_xml.as_deref(), theme_xml.as_deref());
     let (body, mut items) = split_body(&xml)?;
-    let bullet = items
-        .iter()
-        .filter(|i| i.kind == ItemKind::Paragraph)
-        .find_map(|i| inner_of(&xml[i.span.clone()], b"numPr").map(|n| format!("<w:numPr>{n}</w:numPr>")))
-        .or_else(|| read_part(&mut zip, "word/numbering.xml").ok().flatten().and_then(|n| bullet_numbering(&n)));
+    // New bullets use a bulleted list the document has, or the first list
+    // a paragraph is in.
+    let bullet = numbering_xml.as_deref().and_then(bullet_numbering).or_else(|| {
+        items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Paragraph)
+            .filter_map(|i| inner_of(&xml[i.span.clone()], b"numPr"))
+            .find(|n| !n.contains(r#"w:numId w:val="0""#))
+            .map(|n| format!("<w:numPr>{n}</w:numPr>"))
+    });
+    crate::fonts::embed(embedded_fonts(&mut zip, &rels));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-    // Pictures: their parts, read once however often they are shown.
-    let rels = read_part(&mut zip, &rels_path("word/document.xml"))?.map(|x| rels_of(&x)).unwrap_or_default();
-    let mut parts: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
-    let empty = Arc::new(Vec::new());
-    for run in items.iter_mut().flat_map(|i| i.blocks.iter_mut()).flat_map(|b| match b {
-        Block::Paragraph { runs, .. } => runs.iter_mut(),
-        Block::Table { .. } => [].iter_mut(),
-    }) {
-        let Some(image) = run.image.as_mut() else { continue };
-        let Some(origin) = image.origin.as_ref() else { continue };
-        let part = origin
-            .rel
-            .as_ref()
-            .and_then(|r| rels.iter().find(|x| &x.id == r && !x.external))
-            .map(|r| resolve("word", &r.target));
-        image.data = match part {
-            Some(part) => match parts.get(&part) {
-                Some(data) => data.clone(),
-                None => {
-                    let mut data = Vec::new();
-                    if let Ok(mut f) = zip.by_name(&part) {
-                        let _ = f.read_to_end(&mut data);
-                    }
-                    let data = Arc::new(data);
-                    parts.insert(part, data.clone());
-                    data
-                }
-            },
-            None => empty.clone(),
-        };
-        image.origin = Some(Arc::new(Origin { doc: id, xml: origin.xml.clone(), rel: origin.rel.clone() }));
+    let mut pictures = Pictures { zip: &mut zip, cache: HashMap::new(), doc: id };
+    for item in items.iter_mut() {
+        pictures.fill(&mut item.blocks, "word", &rels);
     }
 
-    let page = page_setup(&xml, styles_xml.as_deref());
-    Ok(Docx { id, package: bytes.to_vec(), xml, body, items, styles, bullet, page })
+    // The sections: each paragraph that ends one holds its properties; the
+    // body's own come last. A section without a header or footer of a kind
+    // has the one before it's.
+    let defaults = page_setup("", styles_xml.as_deref());
+    let mut ends: Vec<(Option<usize>, String)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.kind != ItemKind::Other)
+        .filter_map(|(i, item)| {
+            let x = &xml[item.span.clone()];
+            x.contains("<w:sectPr").then(|| inner_of(x, b"sectPr").map(|s| (Some(i), s))).flatten()
+        })
+        .collect();
+    ends.push((None, xml.rfind("<w:sectPr").and_then(|at| inner_of(&xml[at..], b"sectPr")).unwrap_or_default()));
+    let mut parts: HashMap<String, Vec<Block>> = HashMap::new();
+    let mut inherited: HashMap<(bool, String), Vec<Block>> = HashMap::new();
+    let mut sections = Vec::new();
+    for (n, (end, sect)) in ends.iter().enumerate() {
+        for (kind, x) in children(sect) {
+            let header = match kind.as_str() {
+                "headerReference" => true,
+                "footerReference" => false,
+                _ => continue,
+            };
+            let which = attr_value(&x, "type").unwrap_or_else(|| "default".into());
+            let Some(rid) = attr_value(&x, "id") else { continue };
+            if !parts.contains_key(&rid) {
+                let Some(rel) = rels.iter().find(|r| r.id == rid && !r.external) else { continue };
+                let part = resolve("word", &rel.target);
+                let Some(content) = read_part(pictures.zip, &part).ok().flatten() else { continue };
+                let mut blocks = parse(&content);
+                let part_rels = read_part(pictures.zip, &rels_path(&part)).ok().flatten().map(|x| rels_of(&x)).unwrap_or_default();
+                let dir = part.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+                pictures.fill(&mut blocks, &dir, &part_rels);
+                // Each restyled on its own: its lists are its own.
+                restyle_with(&sheet, &styles, &mut blocks, &mut Counters::default());
+                parts.insert(rid.clone(), blocks);
+            }
+            if let Some(blocks) = parts.get(&rid) {
+                inherited.insert((header, which), blocks.clone());
+            }
+        }
+        let title_page = children(sect).iter().any(|(k, x)| k == "titlePg" && attr_value(x, "val").is_none_or(|v| v != "0" && v != "false"));
+        let get = |header: bool, which: &str| inherited.get(&(header, which.to_string())).cloned();
+        let decor = Decor {
+            header: get(true, "default").unwrap_or_default(),
+            footer: get(false, "default").unwrap_or_default(),
+            first_header: title_page.then(|| get(true, "first").unwrap_or_default()),
+            first_footer: title_page.then(|| get(false, "first").unwrap_or_default()),
+        };
+        let kind = children(sect).into_iter().find(|(k, _)| k == "type").and_then(|(_, x)| attr_value(&x, "val"));
+        let restart = children(sect).into_iter().find(|(k, _)| k == "pgNumType").and_then(|(_, x)| attr_value(&x, "start")).and_then(|v| v.parse().ok());
+        sections.push(Section { page: section_page(&defaults, sect), decor, continuous: kind.as_deref() == Some("continuous"), restart });
+        // The paragraph ending the section says so.
+        if let Some(i) = *end
+            && let Some(Block::Paragraph { look, .. }) = items[i].blocks.last_mut()
+        {
+            Arc::make_mut(look).direct.section = Some(n);
+        }
+    }
+
+    // The notes, each given to its reference, numbered in turn.
+    let mut notes = HashMap::new();
+    for (foot, kind) in [(true, "footnote"), (false, "endnote")] {
+        let Some(rel) = rels.iter().find(|r| r.kind.ends_with(&format!("/{kind}s")) && !r.external) else { continue };
+        let part = resolve("word", &rel.target);
+        let Some(content) = read_part(pictures.zip, &part).ok().flatten() else { continue };
+        let part_rels = read_part(pictures.zip, &rels_path(&part)).ok().flatten().map(|x| rels_of(&x)).unwrap_or_default();
+        let dir = part.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+        for (k, note) in children(&inner_of(&content, format!("{kind}s").as_bytes()).unwrap_or_default()) {
+            // Not the separator lines Word keeps as notes.
+            if k != kind || attr_value(&note, "type").is_some_and(|t| t != "normal") {
+                continue;
+            }
+            let Some(id) = attr_value(&note, "id") else { continue };
+            let mut blocks = parse(&note);
+            pictures.fill(&mut blocks, &dir, &part_rels);
+            restyle_with(&sheet, &styles, &mut blocks, &mut Counters::default());
+            notes.insert((foot, id), blocks);
+        }
+    }
+    if !notes.is_empty() {
+        let mut count = [0u32; 2];
+        for item in items.iter_mut() {
+            each_run(&mut item.blocks, &mut |run| {
+                let Some(note) = run.note.as_mut() else { return };
+                let mark = if note.custom {
+                    String::new()
+                } else {
+                    let n = &mut count[note.foot as usize];
+                    *n += 1;
+                    // Endnotes are numbered i, ii, iii, as Word does.
+                    if note.foot { n.to_string() } else { look::number(*n, "lowerRoman") }
+                };
+                let mut blocks = notes.get(&(note.foot, note.id.clone())).cloned().unwrap_or_default();
+                each_run(&mut blocks, &mut |r| {
+                    if r.field == Some(Field::NoteMark) {
+                        r.field = None;
+                        r.text = mark.clone();
+                    }
+                });
+                Arc::make_mut(note).blocks = blocks;
+                run.text = mark;
+            });
+        }
+    }
+
+    let page = sections.last().map(|s| s.page.clone()).unwrap_or_default();
+    let mut doc = Docx {
+        id,
+        package: bytes.to_vec(),
+        xml: xml.clone(),
+        body,
+        items: Vec::new(),
+        styles,
+        bullet,
+        page,
+        sheet,
+        sections,
+    };
+    let mut counters = Counters::default();
+    for item in items.iter_mut() {
+        doc.restyle(&mut item.blocks, &mut counters);
+    }
+    doc.items = items;
+    Ok(doc)
+}
+
+/// Every run in `blocks`, in tables too, in order.
+fn each_run(blocks: &mut [Block], f: &mut dyn FnMut(&mut Run)) {
+    for block in blocks {
+        match block {
+            Block::Paragraph { runs, .. } => runs.iter_mut().for_each(&mut *f),
+            Block::Table(t) => {
+                for cell in t.rows.iter_mut().flatten() {
+                    each_run(&mut cell.blocks, f);
+                }
+            }
+        }
+    }
+}
+
+/// Fills in pictures' bytes from the package, each part read once.
+struct Pictures<'z, 'b> {
+    zip: &'z mut zip::ZipArchive<std::io::Cursor<&'b [u8]>>,
+    cache: HashMap<String, Arc<Vec<u8>>>,
+    doc: u64,
+}
+
+impl Pictures<'_, '_> {
+    /// The pictures in `blocks`, from a part in `dir` with `rels`.
+    fn fill(&mut self, blocks: &mut [Block], dir: &str, rels: &[Rel]) {
+        for block in blocks {
+            match block {
+                Block::Paragraph { runs, .. } => {
+                    for run in runs.iter_mut() {
+                        if let Some(shape) = run.shape.as_mut() {
+                            self.fill(&mut Arc::make_mut(shape).text, dir, rels);
+                        }
+                        let Some(image) = run.image.as_mut() else { continue };
+                        let Some(origin) = image.origin.clone() else { continue };
+                        let part = origin
+                            .rel
+                            .as_ref()
+                            .and_then(|r| rels.iter().find(|x| &x.id == r && !x.external))
+                            .map(|r| resolve(dir, &r.target));
+                        image.data = match part {
+                            Some(part) => {
+                                if let Some(data) = self.cache.get(&part) {
+                                    data.clone()
+                                } else {
+                                    let mut data = Vec::new();
+                                    if let Ok(mut f) = self.zip.by_name(&part) {
+                                        let _ = f.read_to_end(&mut data);
+                                    }
+                                    let data = Arc::new(data);
+                                    self.cache.insert(part, data.clone());
+                                    data
+                                }
+                            }
+                            None => Arc::default(),
+                        };
+                        image.origin = Some(Arc::new(Origin { doc: self.doc, xml: origin.xml.clone(), rel: origin.rel.clone() }));
+                    }
+                }
+                Block::Table(t) => {
+                    for cell in t.rows.iter_mut().flatten() {
+                        self.fill(&mut cell.blocks, dir, rels);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Work out how each paragraph and run in `blocks` looks, lists counted on
+/// from `counters`.
+fn restyle_with(sheet: &Sheet, styles: &HashSet<String>, blocks: &mut [Block], counters: &mut Counters) {
+    for block in blocks {
+        match block {
+            Block::Paragraph { style, runs, align, look } => {
+                let mut l = sheet.look(look.style_id.as_deref(), &look.direct, counters);
+                // A kind of paragraph the document has no style for is
+                // written with formatting of its own; it looks it.
+                let styled = look.style_id.as_ref().is_some_and(|id| styles.contains(id));
+                if !styled {
+                    builtin(&mut l, *style);
+                }
+                *align = l.align;
+                match (&l.label, *style) {
+                    (Some(_), ParaStyle::Normal) => *style = ParaStyle::ListItem(look.direct.level.unwrap_or(0)),
+                    (None, ParaStyle::ListItem(_)) => *style = ParaStyle::Normal,
+                    _ => {}
+                }
+                for run in runs.iter_mut() {
+                    let mut r = sheet.run_look(&l, &run.props);
+                    r.bold |= run.bold;
+                    r.italic |= run.italic;
+                    r.underline |= run.underline;
+                    if run.highlight && r.highlight.is_none() {
+                        r.highlight = Some([255, 255, 0]);
+                    }
+                    run.look = Some(Arc::new(r));
+                }
+                *look = Arc::new(l);
+            }
+            Block::Table(t) => {
+                // Lines and margins: the table's own over its style's.
+                let (mut lines, style_pad) = sheet.table_style(t.style_id.as_deref());
+                lines.extend(t.direct_edges.clone());
+                let side = |name: &str| lines.get(name).copied().flatten();
+                t.edges = look::Borders {
+                    top: side("top"),
+                    left: side("left"),
+                    bottom: side("bottom"),
+                    right: side("right"),
+                    inside_h: side("insideH"),
+                    inside_v: side("insideV"),
+                };
+                for i in 0..4 {
+                    t.pad[i] = t.direct_pad[i].or(style_pad[i]).unwrap_or(CELL_PAD[i]);
+                }
+                t.borders = t.edges.any() || t.rows.iter().flatten().any(|c| c.edges.values().any(Option::is_some));
+                for cell in t.rows.iter_mut().flatten() {
+                    restyle_with(sheet, styles, &mut cell.blocks, counters);
+                }
+            }
+        }
+        if let Block::Paragraph { runs, .. } = block {
+            for run in runs.iter_mut() {
+                if let Some(shape) = run.shape.as_mut() {
+                    restyle_with(sheet, styles, &mut Arc::make_mut(shape).text, &mut Counters::default());
+                }
+            }
+        }
+    }
+}
+
+/// The look Raven Viewer gives a heading, title or quote in a document
+/// without a style for it — what `paragraph` writes for one.
+pub fn builtin(look: &mut Look, style: ParaStyle) {
+    let navy = Some([0x1F, 0x38, 0x64]);
+    match style {
+        ParaStyle::Title => {
+            look.run.size = 28.0;
+            look.after = look.after.max(8.0);
+        }
+        ParaStyle::Heading(n) => {
+            look.run.size = match n {
+                1 => 16.0,
+                2 => 13.0,
+                _ => 12.0,
+            };
+            look.run.bold = true;
+            look.run.color = look.run.color.or(navy);
+            look.before = look.before.max(if n == 1 { 18.0 } else { 10.0 });
+            look.after = look.after.max(4.0);
+            look.keep_next = true;
+        }
+        ParaStyle::Quote => {
+            look.run.italic = true;
+            look.left = look.left.max(36.0);
+        }
+        _ => {}
+    }
 }
 
 /// A bulleted list the numbering part defines, as the `numPr` to use it.
@@ -354,39 +890,9 @@ fn bullet_numbering(numbering: &str) -> Option<String> {
         .map(|(id, _)| format!(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="{id}"/></w:numPr>"#))
 }
 
-/// The paper and margins of the last section, and the text defaults the
-/// styles set.
-fn page_setup(document: &str, styles: Option<&str>) -> PageSetup {
+/// The text defaults the styles set (the paper is the default's).
+fn page_setup(_document: &str, styles: Option<&str>) -> PageSetup {
     let mut page = PageSetup::default();
-    let twips = |v: Option<String>| v.and_then(|v| v.parse::<f64>().ok()).map(|t| t / 20.0);
-    if let Some(at) = document.rfind("<w:sectPr")
-        && let sect = &document[at..]
-        && let Some(open_end) = sect.find('>')
-        && !sect[..open_end].ends_with('/')
-    {
-        let inner = &sect[open_end + 1..sect.find("</w:sectPr>").unwrap_or(sect.len())];
-        for (name, x) in children(inner) {
-            match name.as_str() {
-                "pgSz" => {
-                    if let (Some(w), Some(h)) = (twips(attr_value(&x, "w")), twips(attr_value(&x, "h"))) {
-                        (page.width, page.height) = (w, h);
-                    }
-                }
-                "pgMar" => {
-                    let side = |names: &[&str], old: f64| {
-                        names.iter().find_map(|n| twips(attr_value(&x, n))).map_or(old, |v| v.abs())
-                    };
-                    page.margins = [
-                        side(&["top"], page.margins[0]),
-                        side(&["right", "end"], page.margins[1]),
-                        side(&["bottom"], page.margins[2]),
-                        side(&["left", "start"], page.margins[3]),
-                    ];
-                }
-                _ => {}
-            }
-        }
-    }
     let Some(styles) = styles else { return page };
     // The document defaults, then what the Normal style says on top.
     let normal = children(inner_of(styles, b"styles").as_deref().unwrap_or_default())
@@ -424,6 +930,34 @@ fn page_setup(document: &str, styles: Option<&str>) -> PageSetup {
                 Ok(Event::Eof) | Err(_) => break,
                 _ => {}
             }
+        }
+    }
+    page
+}
+
+/// A section's paper and margins, over the document's defaults.
+fn section_page(defaults: &PageSetup, sect: &str) -> PageSetup {
+    let mut page = defaults.clone();
+    let twips = |v: Option<String>| v.and_then(|v| v.parse::<f64>().ok()).map(|t| t / 20.0);
+    for (name, x) in children(sect) {
+        match name.as_str() {
+            "pgSz" => {
+                if let (Some(w), Some(h)) = (twips(attr_value(&x, "w")), twips(attr_value(&x, "h"))) {
+                    (page.width, page.height) = (w, h);
+                }
+            }
+            "pgMar" => {
+                let side = |names: &[&str], old: f64| names.iter().find_map(|n| twips(attr_value(&x, n))).map_or(old, |v| v.abs());
+                page.margins = [
+                    side(&["top"], page.margins[0]),
+                    side(&["right", "end"], page.margins[1]),
+                    side(&["bottom"], page.margins[2]),
+                    side(&["left", "start"], page.margins[3]),
+                ];
+                page.header = side(&["header"], page.header);
+                page.footer = side(&["footer"], page.footer);
+            }
+            _ => {}
         }
     }
     page
@@ -486,25 +1020,59 @@ impl Docx {
     }
 
     /// What `out` shows, paragraph by paragraph: what the document holds where
-    /// it is kept, and the edits where it is not.
+    /// it is kept, and the edits where it is not — each paragraph's look
+    /// worked out again, so a new list item takes the next number.
     pub fn blocks_of(&self, out: &[Out]) -> Vec<Block> {
         let mut blocks = Vec::new();
         for o in out {
             match o {
                 Out::Keep(i) => blocks.extend(self.items[*i].blocks.iter().cloned()),
                 Out::Para { style, runs, base } => {
-                    let align = base
-                        .and_then(|b| match self.items[b].blocks.first() {
-                            Some(Block::Paragraph { align, .. }) => Some(*align),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    blocks.push(Block::Paragraph { style: *style, runs: runs.clone(), align });
+                    let original = base.and_then(|b| match self.items[b].blocks.first() {
+                        Some(Block::Paragraph { style: s, look, .. }) if s == style => Some(look.clone()),
+                        _ => None,
+                    });
+                    // Edited from a paragraph of the same kind, it keeps that
+                    // paragraph's properties; otherwise it has those the
+                    // kind's style gives.
+                    let look = original
+                        .map(|l| Look { style_id: l.style_id.clone(), direct: l.direct.clone(), ..Default::default() })
+                        .unwrap_or_else(|| self.new_look(*style));
+                    blocks.push(Block::Paragraph { style: *style, runs: runs.clone(), align: Align::Start, look: Arc::new(look) });
                 }
                 Out::Block(b) => blocks.push(b.clone()),
             }
         }
+        self.restyle(&mut blocks, &mut Counters::default());
         blocks
+    }
+
+    /// What a new paragraph of a kind is written with: the document's
+    /// style for it, and for a list item, the document's bulleted list.
+    fn new_look(&self, style: ParaStyle) -> Look {
+        let id = style_id(style).filter(|id| self.styles.contains(*id)).map(str::to_string);
+        let mut direct = look::ParaProps::default();
+        if let ParaStyle::ListItem(level) = style
+            && !id.as_deref().is_some_and(|i| self.sheet.numbered(Some(i)))
+        {
+            direct.num = self.bullet.as_deref().and_then(numid_of);
+            direct.level = Some(level);
+        }
+        Look { style_id: id, direct, ..Default::default() }
+    }
+
+    /// How a new paragraph of a kind looks in this document.
+    pub fn look_for(&self, style: ParaStyle) -> Arc<Look> {
+        let mut block = [Block::Paragraph { style, runs: Vec::new(), align: Align::Start, look: Arc::new(self.new_look(style)) }];
+        self.restyle(&mut block, &mut Counters::default());
+        match block {
+            [Block::Paragraph { look, .. }] => look,
+            _ => Arc::default(),
+        }
+    }
+
+    fn restyle(&self, blocks: &mut [Block], counters: &mut Counters) {
+        restyle_with(&self.sheet, &self.styles, blocks, counters);
     }
 
     fn write_body(&self, out: &[Out], media: &mut Media) -> String {
@@ -546,10 +1114,10 @@ impl Docx {
             match o {
                 Out::Keep(i) => emit(*i, &mut body, &mut emitted),
                 Out::Para { style, runs, base } => body.push_str(&self.paragraph(*style, runs, *base, None, media)),
-                Out::Block(Block::Paragraph { style, runs, align }) => {
+                Out::Block(Block::Paragraph { style, runs, align, .. }) => {
                     body.push_str(&self.paragraph(*style, runs, None, Some(*align), media))
                 }
-                Out::Block(Block::Table { rows }) => body.push_str(&self.table(rows)),
+                Out::Block(Block::Table(t)) => body.push_str(&self.table(t, media)),
             }
         }
         // Whatever travelled with a deleted paragraph is still kept.
@@ -628,7 +1196,11 @@ impl Docx {
             ParaStyle::Quote if !styled => vec![("i", "<w:i/>".into())],
             _ => vec![],
         };
-        let listed_without_numbering = matches!(style, ParaStyle::ListItem(_)) && !ppr.contains("numPr");
+        // A list item numbered by its style has no numPr of its own; only
+        // one with no list at all gets a bullet typed in.
+        let pstyle = children(&ppr).into_iter().find(|(n, _)| n == "pStyle").and_then(|(_, x)| attr_value(&x, "val"));
+        let listed_without_numbering =
+            matches!(style, ParaStyle::ListItem(_)) && !ppr.contains("numPr") && !self.sheet.numbered(pstyle.as_deref());
 
         let mut xml = String::from("<w:p>");
         if !ppr.is_empty() {
@@ -651,38 +1223,80 @@ impl Docx {
         xml
     }
 
-    /// A plain bordered table, its columns sharing the text width.
-    fn table(&self, rows: &[Vec<String>]) -> String {
-        let cols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
-        let width = ((self.page.width - self.page.margins[1] - self.page.margins[3]) * 20.0) as i64;
-        let col = width / cols as i64;
+    /// A table: its columns (as the table says, or sharing the text width),
+    /// each cell's paragraphs, spans, merges and shading.
+    fn table(&self, t: &Table, media: &mut Media) -> String {
+        let cols = t.columns().max(1);
+        let text_width = ((self.page.width - self.page.margins[1] - self.page.margins[3]) * 20.0) as i64;
+        let widths: Vec<i64> = if t.widths.len() == cols && t.widths.iter().all(|w| *w > 0.0) {
+            t.widths.iter().map(|w| (w * 20.0) as i64).collect()
+        } else {
+            vec![text_width / cols as i64; cols]
+        };
         let border = |side: &str| format!(r#"<w:{side} w:val="single" w:sz="4" w:space="0" w:color="auto"/>"#);
-        let mut xml = format!(
-            r#"<w:tbl><w:tblPr><w:tblW w:w="{width}" w:type="dxa"/><w:tblBorders>{}{}{}{}{}{}</w:tblBorders><w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid>"#,
-            border("top"), border("left"), border("bottom"), border("right"), border("insideH"), border("insideV")
-        );
-        for _ in 0..cols {
-            xml.push_str(&format!(r#"<w:gridCol w:w="{col}"/>"#));
+        let borders = if t.borders {
+            format!(
+                "<w:tblBorders>{}{}{}{}{}{}</w:tblBorders>",
+                border("top"), border("left"), border("bottom"), border("right"), border("insideH"), border("insideV")
+            )
+        } else {
+            String::new()
+        };
+        let total: i64 = widths.iter().sum();
+        let mut xml = format!(r#"<w:tbl><w:tblPr><w:tblW w:w="{total}" w:type="dxa"/>{borders}<w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid>"#);
+        for w in &widths {
+            xml.push_str(&format!(r#"<w:gridCol w:w="{w}"/>"#));
         }
         xml.push_str("</w:tblGrid>");
-        for row in rows {
+        for row in &t.rows {
             xml.push_str("<w:tr>");
-            for c in 0..cols {
-                xml.push_str(&format!(r#"<w:tc><w:tcPr><w:tcW w:w="{col}" w:type="dxa"/></w:tcPr>"#));
-                for line in row.get(c).map_or("", String::as_str).split('\n') {
-                    xml.push_str("<w:p>");
-                    if !line.is_empty() {
-                        xml.push_str(&write_run(&Run { text: line.into(), ..Default::default() }, &[]));
+            let mut col = 0;
+            for cell in row {
+                let span = cell.span.max(1);
+                let width: i64 = widths.iter().skip(col).take(span).sum();
+                col += span;
+                let mut props = format!(r#"<w:tcW w:w="{width}" w:type="dxa"/>"#);
+                if span > 1 {
+                    props.push_str(&format!(r#"<w:gridSpan w:val="{span}"/>"#));
+                }
+                if cell.merged {
+                    props.push_str("<w:vMerge/>");
+                }
+                if let Some([r, g, b]) = cell.shade {
+                    props.push_str(&format!(r#"<w:shd w:val="clear" w:color="auto" w:fill="{r:02X}{g:02X}{b:02X}"/>"#));
+                }
+                xml.push_str(&format!("<w:tc><w:tcPr>{props}</w:tcPr>"));
+                for block in &cell.blocks {
+                    match block {
+                        Block::Paragraph { style, runs, align, .. } => xml.push_str(&self.paragraph(*style, runs, None, Some(*align), media)),
+                        Block::Table(inner) => xml.push_str(&self.table(inner, media)),
                     }
-                    xml.push_str("</w:p>");
+                }
+                // A cell ends with a paragraph.
+                if !matches!(cell.blocks.last(), Some(Block::Paragraph { .. })) {
+                    xml.push_str("<w:p/>");
                 }
                 xml.push_str("</w:tc>");
+            }
+            // Short rows are filled out to the grid.
+            while col < cols {
+                xml.push_str(&format!(r#"<w:tc><w:tcPr><w:tcW w:w="{}" w:type="dxa"/></w:tcPr><w:p/></w:tc>"#, widths[col]));
+                col += 1;
             }
             xml.push_str("</w:tr>");
         }
         xml.push_str("</w:tbl>");
         xml
     }
+}
+
+/// The list a `numPr` names.
+fn numid_of(numpr: &str) -> Option<u32> {
+    children(numpr.trim_start_matches("<w:numPr>").trim_end_matches("</w:numPr>"))
+        .into_iter()
+        .find(|(n, _)| n == "numId")
+        .and_then(|(_, x)| attr_value(&x, "val"))
+        .and_then(|v| v.parse().ok())
 }
 
 /// Pictures being written: new ones become parts of the package, and every
@@ -1107,29 +1721,77 @@ fn children(xml: &str) -> Vec<(String, String)> {
     }
 }
 
+/// The paragraphs and tables in a stretch of document XML — a body's child,
+/// a table cell, a header.
 pub fn parse(xml: &str) -> Vec<Block> {
     let mut reader = Reader::from_str(xml);
     let mut blocks = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = local(e.name().as_ref()).to_vec();
+                if matches!(name.as_slice(), b"p" | b"tbl" | b"txbxContent" | b"Fallback" | b"sectPr" | b"tblPr" | b"tblGrid") {
+                    let end = e.name().as_ref().to_vec();
+                    if reader.read_to_end(quick_xml::name::QName(&end)).is_err() {
+                        break;
+                    }
+                    let span = &xml[before..reader.buffer_position() as usize];
+                    match name.as_slice() {
+                        b"p" => blocks.push(paragraph(span)),
+                        b"tbl" => blocks.push(Block::Table(Box::new(table(span)))),
+                        _ => {}
+                    }
+                }
+                // Anything else (content controls, custom XML…) holds
+                // paragraphs of its own: read on into it.
+            }
+            Ok(Event::Empty(e)) if local(e.name().as_ref()) == b"p" => {
+                blocks.push(Block::paragraph(ParaStyle::Normal, vec![]));
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    blocks
+}
 
+/// A field being read: its instructions, and whether its result (what it
+/// shows) has started.
+struct FieldState {
+    instr: String,
+    result: bool,
+    /// Its result has shown something.
+    shown: bool,
+}
+
+impl FieldState {
+    fn kind(&self) -> Option<Field> {
+        let word = self.instr.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        match word.as_str() {
+            "PAGE" => Some(Field::Page),
+            "NUMPAGES" | "SECTIONPAGES" => Some(Field::Pages),
+            _ => None,
+        }
+    }
+}
+
+/// One `<w:p>`.
+fn paragraph(xml: &str) -> Block {
+    let mut reader = Reader::from_str(xml);
     let mut style = ParaStyle::Normal;
-    let mut align = Align::Start;
+    let mut style_id: Option<String> = None;
+    let mut direct = look::ParaProps::default();
     let mut runs: Vec<Run> = Vec::new();
     let mut run = Run::default();
     let mut in_text = false;
+    let mut in_instr = false;
     let mut list_level: Option<u8> = None;
-    // Where the run's properties start, so they can be kept as XML.
     let mut rpr_start: Option<usize> = None;
-    // Text boxes and the fallback copies of drawings hold paragraphs of
-    // their own; they are not part of this paragraph's text.
-    let mut skip = 0usize;
-    // A picture being read: where its element starts, at what depth.
     let mut depth = 0usize;
     let mut drawing: Option<Drawing> = None;
-
-    // Tables: collect cell text; nested paragraphs inside a cell become lines.
-    let mut table_depth = 0usize;
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut cell = String::new();
+    let mut fields: Vec<FieldState> = Vec::new();
+    let mut simple: Vec<(usize, Option<Field>)> = Vec::new();
 
     loop {
         let before = reader.buffer_position() as usize;
@@ -1138,14 +1800,6 @@ pub fn parse(xml: &str) -> Vec<Block> {
             Ok(e) => e,
         };
         let after = reader.buffer_position() as usize;
-        if skip > 0 {
-            match event {
-                Event::Start(_) => skip += 1,
-                Event::End(_) => skip -= 1,
-                _ => {}
-            }
-            continue;
-        }
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let empty = matches!(event, Event::Empty(_));
@@ -1157,11 +1811,41 @@ pub fn parse(xml: &str) -> Vec<Block> {
                     d.read(e);
                     continue;
                 }
-                match local(e.name().as_ref()) {
-                    b"txbxContent" | b"Fallback" if !empty => {
-                        skip = 1;
-                        depth -= 1;
+                let name = local(e.name().as_ref()).to_vec();
+                // What is read whole: the paragraph's properties, equations,
+                // text boxes and the fallback copies of drawings.
+                if !empty && matches!(name.as_slice(), b"pPr" | b"oMath" | b"oMathPara" | b"txbxContent" | b"Fallback") {
+                    let end = e.name().as_ref().to_vec();
+                    let Ok(span) = reader.read_to_end(quick_xml::name::QName(&end)) else { break };
+                    depth -= 1;
+                    let inner = &xml[span.start as usize..span.end as usize];
+                    match name.as_slice() {
+                        b"pPr" => {
+                            direct = look::para_props(inner);
+                            let (s, id, level) = para_style(inner);
+                            (style, style_id, list_level) = (s, id, level);
+                        }
+                        b"oMath" | b"oMathPara" => {
+                            let math = crate::omml::linear(&xml[before..reader.buffer_position() as usize]);
+                            runs.push(Run { text: math.plain, math: Some(math.markup), placeholder: true, ..Default::default() });
+                        }
+                        // What Word drew instead of a drawing it could not
+                        // show: a picture, often, to show in its place.
+                        b"Fallback" if runs.last().is_some_and(|r| r.placeholder && r.math.is_none()) => {
+                            let picture = match paragraph(&format!("<w:p><w:r>{inner}</w:r></w:p>")) {
+                                Block::Paragraph { runs, .. } => runs.into_iter().find(|r| r.image.is_some()),
+                                _ => None,
+                            };
+                            if let Some(picture) = picture {
+                                runs.pop();
+                                runs.push(picture);
+                            }
+                        }
+                        _ => {}
                     }
+                    continue;
+                }
+                match name.as_slice() {
                     b"drawing" | b"pict" | b"object" => {
                         if empty {
                             runs.push(placeholder("[image]"));
@@ -1169,67 +1853,88 @@ pub fn parse(xml: &str) -> Vec<Block> {
                             drawing = Some(Drawing { start: before, depth, ..Default::default() });
                         }
                     }
-                    b"oMath" => {
-                        runs.push(placeholder("[equation]"));
-                        if !empty {
-                            skip = 1;
-                            depth -= 1;
+                    b"r" => {
+                        run = Run::default();
+                        if let Some(f) = fields.iter().rev().find(|f| f.result).and_then(FieldState::kind) {
+                            run.field = Some(f);
+                        }
+                        if let Some((_, f)) = simple.last() {
+                            run.field = *f;
                         }
                     }
-                    b"p" => {
-                        style = ParaStyle::Normal;
-                        align = Align::Start;
-                        runs.clear();
-                        list_level = None;
-                    }
-                    b"jc" => align = Align::from_jc(&val(e).unwrap_or_default()),
-                    b"pStyle" => {
-                        let name = val(e).unwrap_or_default().to_ascii_lowercase();
-                        style = if name == "title" {
-                            ParaStyle::Title
-                        } else if let Some(n) = name.strip_prefix("heading") {
-                            ParaStyle::Heading(n.trim().parse().unwrap_or(1).clamp(1, 6))
-                        } else if name.contains("quote") {
-                            ParaStyle::Quote
-                        } else if name.contains("list") {
-                            ParaStyle::ListItem(0)
-                        } else {
-                            style
-                        };
-                    }
-                    b"outlineLvl" if style == ParaStyle::Normal => {
-                        if let Some(level) = val(e).and_then(|v| v.parse::<u8>().ok()).filter(|l| *l < 9) {
-                            style = ParaStyle::Heading((level + 1).min(6));
-                        }
-                    }
-                    b"ilvl" => list_level = Some(val(e).and_then(|v| v.parse().ok()).unwrap_or(0)),
-                    b"numPr" => list_level = list_level.or(Some(0)),
-                    b"r" => run = Run::default(),
                     b"rPr" if !empty => rpr_start = Some(after),
                     b"b" => run.bold = toggle(e),
                     b"i" => run.italic = toggle(e),
-                    b"u" => run.underline = toggle(e),
+                    b"u" => run.underline = val(e).is_some_and(|v| v != "none"),
                     b"highlight" => run.highlight = val(e).is_some_and(|v| v != "none"),
-                    b"t" if !empty => in_text = true,
-                    b"tab" => run.text.push('\t'),
-                    b"br" if matches!(attr(e, b"type").as_deref(), Some("page" | "column")) => {
-                        runs.push(Run::page_break())
+                    // Field instructions are not shown; deleted text either.
+                    b"t" if !empty && !fields.iter().any(|f| !f.result) => in_text = true,
+                    b"instrText" if !empty => in_instr = true,
+                    b"fldChar" => match attr(e, b"fldCharType").as_deref() {
+                        Some("begin") => fields.push(FieldState { instr: String::new(), result: false, shown: false }),
+                        Some("separate") => {
+                            if let Some(f) = fields.last_mut() {
+                                f.result = true;
+                            }
+                        }
+                        Some("end") => {
+                            // A page number with no result saved still shows one.
+                            if let Some(f) = fields.pop()
+                                && !f.shown
+                                && let Some(kind) = f.kind()
+                            {
+                                runs.push(Run { text: "1".into(), field: Some(kind), props: run.props.clone(), ..Default::default() });
+                            }
+                        }
+                        _ => {}
+                    },
+                    b"fldSimple" if !empty => {
+                        let state = FieldState { instr: attr(e, b"instr").unwrap_or_default(), result: true, shown: false };
+                        simple.push((depth, state.kind()));
                     }
-                    b"br" | b"cr" => run.text.push(LINE_BREAK),
-                    b"tbl" => {
-                        table_depth += 1;
-                        if table_depth == 1 {
-                            rows.clear();
+                    b"footnoteReference" | b"endnoteReference" => {
+                        let note = Note {
+                            foot: name == b"footnoteReference",
+                            id: attr(e, b"id").unwrap_or_default(),
+                            custom: attr(e, b"customMarkFollows").is_some_and(|v| v == "1" || v == "true"),
+                            blocks: Vec::new(),
+                        };
+                        run.note = Some(Arc::new(note));
+                        run.text.push('*');
+                    }
+                    b"footnoteRef" | b"endnoteRef" => {
+                        run.field = Some(Field::NoteMark);
+                        run.text.push('*');
+                    }
+                    b"tab" if !fields.iter().any(|f| !f.result) => run.text.push('\t'),
+                    b"noBreakHyphen" => run.text.push('\u{2011}'),
+                    b"sym" => {
+                        if let Some(c) = attr(e, b"char").and_then(|c| u32::from_str_radix(&c, 16).ok()) {
+                            // Symbol-font characters live in the private use
+                            // area, written from F000.
+                            let c = if (0xF000..0xF100).contains(&c) { c - 0xF000 } else { c };
+                            if let Some(c) = char::from_u32(c).filter(|c| !c.is_control()) {
+                                run.text.push(c);
+                            }
                         }
                     }
-                    b"tr" if table_depth == 1 => rows.push(Vec::new()),
-                    b"tc" if table_depth == 1 => cell.clear(),
+                    b"br" if matches!(attr(e, b"type").as_deref(), Some("page" | "column")) => runs.push(Run::page_break()),
+                    b"br" | b"cr" => run.text.push(LINE_BREAK),
                     _ => {}
                 }
             }
-            Event::Text(t) if in_text => {
+            Event::Text(t) if in_text || in_instr => {
                 if let Ok(text) = t.unescape() {
-                    run.text.push_str(&text);
+                    if in_text {
+                        run.text.push_str(&text);
+                    } else if let Some(f) = fields.last_mut() {
+                        f.instr.push_str(&text);
+                    }
+                }
+            }
+            Event::Text(t) if drawing.is_some() => {
+                if let (Some(d), Ok(text)) = (drawing.as_mut(), t.unescape()) {
+                    d.text(&text);
                 }
             }
             Event::End(_) if drawing.is_some() => {
@@ -1242,46 +1947,25 @@ pub fn parse(xml: &str) -> Vec<Block> {
                 depth = depth.saturating_sub(1);
             }
             Event::End(e) => {
+                if simple.last().is_some_and(|(d, _)| *d == depth) {
+                    simple.pop();
+                }
                 depth = depth.saturating_sub(1);
                 match local(e.name().as_ref()) {
                     b"t" => in_text = false,
+                    b"instrText" => in_instr = false,
                     b"rPr" => {
-                        // Paragraph-mark properties (pPr/rPr) are dropped with the
-                        // run they are never attached to.
                         if let Some(start) = rpr_start.take() {
                             run.props = xml[start..before].to_string();
                         }
                     }
-                    b"r" => {
-                        if !run.text.is_empty() {
-                            runs.push(std::mem::take(&mut run));
+                    b"r" if !run.text.is_empty() => {
+                        if run.field.is_some()
+                            && let Some(f) = fields.iter_mut().rev().find(|f| f.result)
+                        {
+                            f.shown = true;
                         }
-                    }
-                    b"p" => {
-                        if table_depth > 0 {
-                            let line: String =
-                                runs.iter().map(|r| r.text.replace(LINE_BREAK, "\n")).collect::<Vec<_>>().concat();
-                            if !cell.is_empty() {
-                                cell.push('\n');
-                            }
-                            cell.push_str(&line);
-                        } else {
-                            if let (Some(level), ParaStyle::Normal | ParaStyle::ListItem(_)) = (list_level, style) {
-                                style = ParaStyle::ListItem(level);
-                            }
-                            blocks.push(Block::Paragraph { style, runs: std::mem::take(&mut runs), align });
-                        }
-                    }
-                    b"tc" if table_depth == 1 => {
-                        if let Some(row) = rows.last_mut() {
-                            row.push(std::mem::take(&mut cell));
-                        }
-                    }
-                    b"tbl" => {
-                        table_depth = table_depth.saturating_sub(1);
-                        if table_depth == 0 {
-                            blocks.push(Block::Table { rows: std::mem::take(&mut rows) });
-                        }
+                        runs.push(std::mem::take(&mut run));
                     }
                     _ => {}
                 }
@@ -1289,7 +1973,166 @@ pub fn parse(xml: &str) -> Vec<Block> {
             _ => {}
         }
     }
-    blocks
+    if let (Some(level), ParaStyle::Normal | ParaStyle::ListItem(_)) = (list_level, style) {
+        style = ParaStyle::ListItem(level);
+    }
+    let align = direct.align.unwrap_or_default();
+    let look = Look { style_id, direct, ..Default::default() };
+    Block::Paragraph { style, runs, align, look: Arc::new(look) }
+}
+
+/// What a paragraph's properties say about its kind: its style (by the
+/// style's id, as far as the editor tells kinds apart), the style id, and
+/// its list level if it is in a list.
+fn para_style(ppr: &str) -> (ParaStyle, Option<String>, Option<u8>) {
+    let mut reader = Reader::from_str(ppr);
+    let mut style = ParaStyle::Normal;
+    let mut id = None;
+    let mut level: Option<u8> = None;
+    let mut num: Option<u32> = None;
+    let mut outline = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if matches!(local(e.name().as_ref()), b"rPr" | b"pPrChange") => {
+                let end = e.name().as_ref().to_vec();
+                let _ = reader.read_to_end(quick_xml::name::QName(&end));
+            }
+            Ok(Event::Start(e) | Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"pStyle" => {
+                    let raw = val(&e).unwrap_or_default();
+                    let name = raw.to_ascii_lowercase();
+                    style = if name == "title" {
+                        ParaStyle::Title
+                    } else if let Some(n) = name.strip_prefix("heading") {
+                        ParaStyle::Heading(n.trim().parse().unwrap_or(1).clamp(1, 6))
+                    } else if name.contains("quote") {
+                        ParaStyle::Quote
+                    } else if name.contains("list") {
+                        ParaStyle::ListItem(0)
+                    } else {
+                        style
+                    };
+                    id = Some(raw);
+                }
+                b"outlineLvl" => outline = val(&e).and_then(|v| v.parse::<u8>().ok()).filter(|l| *l < 9),
+                b"ilvl" => level = Some(val(&e).and_then(|v| v.parse().ok()).unwrap_or(0)),
+                b"numId" => num = val(&e).and_then(|v| v.parse().ok()),
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    if style == ParaStyle::Normal
+        && let Some(level) = outline
+    {
+        style = ParaStyle::Heading((level + 1).min(6));
+    }
+    // A list of 0 is "not in a list".
+    let level = match num {
+        Some(0) => None,
+        Some(_) => level.or(Some(0)),
+        None => level,
+    };
+    (style, id, level)
+}
+
+/// One `<w:tbl>`: its columns, its rows of cells, each cell's content.
+fn table(xml: &str) -> Table {
+    let mut t = Table::default();
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0usize;
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let name = local(e.name().as_ref()).to_vec();
+                match name.as_slice() {
+                    b"tr" if depth == 2 => {
+                        t.rows.push(Vec::new());
+                        t.heights.push(None);
+                    }
+                    b"tc" | b"tblPr" | b"tblGrid" | b"trPr" if depth == 2 || depth == 3 => {
+                        let end = e.name().as_ref().to_vec();
+                        let Ok(span) = reader.read_to_end(quick_xml::name::QName(&end)) else { break };
+                        depth -= 1;
+                        let inner = &xml[span.start as usize..span.end as usize];
+                        match name.as_slice() {
+                            b"trPr" => {
+                                if let Some((_, x)) = children(inner).into_iter().find(|(n, _)| n == "trHeight")
+                                    && let Some(h) = attr_value(&x, "val").and_then(|v| v.parse::<f64>().ok())
+                                    && let Some(slot) = t.heights.last_mut()
+                                {
+                                    *slot = Some((h / 20.0, attr_value(&x, "hRule").as_deref() == Some("exact")));
+                                }
+                            }
+                            b"tblGrid" => {
+                                // The grid's own columns — not those of a
+                                // tracked change's copy of it.
+                                t.widths = children(inner)
+                                    .iter()
+                                    .filter(|(n, _)| n == "gridCol")
+                                    .map(|(_, c)| attr_value(c, "w").and_then(|w| w.parse::<f64>().ok()).unwrap_or(0.0) / 20.0)
+                                    .collect();
+                            }
+                            b"tblPr" => {
+                                let props = children(inner);
+                                let get = |name: &str| props.iter().find(|(n, _)| n == name).map(|(_, x)| x.clone());
+                                t.style_id = get("tblStyle").and_then(|x| attr_value(&x, "val"));
+                                t.direct_edges = inner_of(inner, b"tblBorders").map(|b| look::edges(&b)).unwrap_or_default();
+                                t.direct_pad = inner_of(inner, b"tblCellMar").map(|m| look::margins(&m)).unwrap_or_default();
+                                t.width = get("tblW").and_then(|x| {
+                                    let w = attr_value(&x, "w")?;
+                                    match attr_value(&x, "type").as_deref() {
+                                        Some("pct") if w.ends_with('%') => w.trim_end_matches('%').parse::<f64>().ok().map(|p| TableWidth::Share(p / 100.0)),
+                                        Some("pct") => w.parse::<f64>().ok().map(|p| TableWidth::Share(p / 5000.0)),
+                                        Some("dxa") => w.parse::<f64>().ok().filter(|w| *w > 0.0).map(|w| TableWidth::Points(w / 20.0)),
+                                        _ => None,
+                                    }
+                                });
+                            }
+                            b"tc" => {
+                                let props = inner_of(inner, b"tcPr").unwrap_or_default();
+                                let span = children(&props)
+                                    .iter()
+                                    .find(|(n, _)| n == "gridSpan")
+                                    .and_then(|(_, x)| attr_value(x, "val"))
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(1usize);
+                                let merged = children(&props)
+                                    .iter()
+                                    .find(|(n, _)| n == "vMerge")
+                                    .is_some_and(|(_, x)| attr_value(x, "val").is_none_or(|v| v == "continue"));
+                                let shade = children(&props)
+                                    .iter()
+                                    .find(|(n, _)| n == "shd")
+                                    .and_then(|(_, x)| attr_value(x, "fill"))
+                                    .and_then(|f| look::color(&f));
+                                let edges = inner_of(&props, b"tcBorders").map(|b| look::edges(&b)).unwrap_or_default();
+                                let valign = match children(&props).iter().find(|(n, _)| n == "vAlign").and_then(|(_, x)| attr_value(x, "val")).as_deref() {
+                                    Some("center") => VAlign::Center,
+                                    Some("bottom") => VAlign::Bottom,
+                                    _ => VAlign::Top,
+                                };
+                                let pad = inner_of(&props, b"tcMar").map(|m| look::margins(&m)).unwrap_or_default();
+                                if let Some(row) = t.rows.last_mut() {
+                                    row.push(Cell { blocks: parse(inner), span, shade, merged, edges, valign, pad });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(_)) => depth = depth.saturating_sub(1),
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        let _ = before;
+    }
+    t
 }
 
 fn placeholder(text: &str) -> Run {
@@ -1305,11 +2148,33 @@ struct Drawing {
     size: Option<(i64, i64)>,
     /// A chart, shape or text box rather than a picture.
     other: bool,
+    anchor: Option<Anchor>,
+    /// Which position (across or down) is being read, for its text.
+    reading: Option<bool>,
+    /// The element whose text comes next.
+    current: Vec<u8>,
 }
 
 impl Drawing {
     fn read(&mut self, e: &BytesStart) {
+        self.current = local(e.name().as_ref()).to_vec();
         match local(e.name().as_ref()) {
+            b"anchor" => {
+                self.anchor = Some(Anchor { behind: attr(e, b"behindDoc").is_some_and(|v| v == "1" || v == "true"), ..Default::default() });
+            }
+            b"wrapSquare" | b"wrapTight" | b"wrapThrough" | b"wrapTopAndBottom" => {
+                if let Some(a) = self.anchor.as_mut() {
+                    a.wrap = true;
+                }
+            }
+            b"positionH" | b"positionV" => {
+                let across = local(e.name().as_ref()) == b"positionH";
+                self.reading = Some(across);
+                if let Some(a) = self.anchor.as_mut() {
+                    let place = if across { &mut a.h } else { &mut a.v };
+                    place.from = attr(e, b"relativeFrom").unwrap_or_default();
+                }
+            }
             b"extent" if self.size.is_none() => {
                 let n = |k: &[u8]| attr(e, k).and_then(|v| v.parse::<i64>().ok());
                 if let (Some(cx), Some(cy)) = (n(b"cx"), n(b"cy")) {
@@ -1336,17 +2201,111 @@ impl Drawing {
         }
     }
 
+    /// Text inside the drawing: a floating picture's offset or alignment.
+    fn text(&mut self, text: &str) {
+        let (Some(across), Some(a)) = (self.reading, self.anchor.as_mut()) else { return };
+        let place = if across { &mut a.h } else { &mut a.v };
+        match self.current.as_slice() {
+            b"posOffset" => place.offset = text.trim().parse::<f64>().unwrap_or(0.0) / EMU_PER_POINT as f64,
+            b"align" => place.align = Some(text.trim().to_string()),
+            _ => {}
+        }
+    }
+
     fn finish(self, xml: &str, props: &str) -> Run {
+        if self.other
+            && xml.contains(":wsp")
+            && let Some(shape) = shape_of(xml, self.size, self.anchor.clone())
+        {
+            return Run { text: OBJECT.into(), shape: Some(Arc::new(shape)), props: props.to_string(), ..Default::default() };
+        }
         match (self.rel, self.other) {
             (Some(rel), false) => {
                 let (cx, cy) = self.size.unwrap_or((0, 0));
                 let origin = Origin { doc: 0, xml: xml.to_string(), rel: Some(rel) };
-                Run { props: props.to_string(), ..Run::picture(Image { data: Arc::default(), cx, cy, origin: Some(Arc::new(origin)) }) }
+                let image = Image { data: Arc::default(), cx, cy, origin: Some(Arc::new(origin)), anchor: self.anchor };
+                Run { props: props.to_string(), ..Run::picture(image) }
             }
             _ if xml.contains("/chart\"") => placeholder("[chart]"),
             _ => placeholder("[image]"),
         }
     }
+}
+
+/// A DrawingML colour inside `xml`: a hex colour, or one of the theme's,
+/// as Office's default theme has it.
+fn drawing_color(xml: &str) -> Option<[u8; 3]> {
+    if let Some(v) = attr_after(xml, "srgbClr", "val") {
+        return look::color(&v);
+    }
+    let scheme = attr_after(xml, "schemeClr", "val")?;
+    look::color(match scheme.as_str() {
+        "accent1" => "4472C4",
+        "accent2" => "ED7D31",
+        "accent3" => "A5A5A5",
+        "accent4" => "FFC000",
+        "accent5" => "5B9BD5",
+        "accent6" => "70AD47",
+        "tx1" | "dk1" | "phClr" => "000000",
+        "bg1" | "lt1" => "FFFFFF",
+        "tx2" | "dk2" => "44546A",
+        "bg2" | "lt2" => "E7E6E6",
+        _ => "808080",
+    })
+}
+
+/// The attribute `name` of the first element called `element` in `xml`.
+fn attr_after(xml: &str, element: &str, name: &str) -> Option<String> {
+    let at = xml.find(&format!(":{element} ")).or_else(|| xml.find(&format!("<{element} ")))?;
+    let tag = &xml[at..at + xml[at..].find('>')?];
+    let key = format!("{name}=\"");
+    let v = &tag[tag.find(&key)? + key.len()..];
+    Some(v[..v.find('"')?].to_string())
+}
+
+/// A drawn shape (`wps:wsp`): its geometry, fill, outline and text.
+fn shape_of(xml: &str, size: Option<(i64, i64)>, anchor: Option<Anchor>) -> Option<Shape> {
+    let sp = inner_of(xml, b"spPr").unwrap_or_default();
+    let geom = attr_after(&sp, "prstGeom", "val").or_else(|| attr_after(&sp, "prstGeom", "prst")).unwrap_or_else(|| "rect".into());
+    // The fill is what spPr says outside its outline; the outline is `a:ln`.
+    let ln_at = sp.find("<a:ln").unwrap_or(sp.len());
+    let body = &sp[..ln_at];
+    let style = inner_of(xml, b"style").unwrap_or_default();
+    let fill = if body.contains("noFill") {
+        None
+    } else if body.contains("solidFill") {
+        drawing_color(&inner_of(body, b"solidFill").unwrap_or_default())
+    } else {
+        inner_of(&style, b"fillRef").and_then(|f| drawing_color(&f))
+    };
+    let ln = &sp[ln_at..];
+    let width = attr_after(ln, "ln", "w").and_then(|w| w.parse::<f64>().ok()).map_or(0.75, |w| w / EMU_PER_POINT as f64);
+    let line = if ln.contains("noFill") {
+        None
+    } else if ln.contains("solidFill") {
+        drawing_color(&inner_of(ln, b"solidFill").unwrap_or_default()).map(|c| (c, width))
+    } else {
+        inner_of(&style, b"lnRef").and_then(|l| drawing_color(&l)).map(|c| (c, width))
+    };
+    let text = inner_of(xml, b"txbxContent").map(|t| parse(&t)).unwrap_or_default();
+    let inset = |name: &str, default: f64| attr_after(xml, "bodyPr", name).and_then(|v| v.parse::<f64>().ok()).map_or(default, |v| v / EMU_PER_POINT as f64);
+    let valign = match attr_after(xml, "bodyPr", "anchor").as_deref() {
+        Some("ctr") => VAlign::Center,
+        Some("b") => VAlign::Bottom,
+        _ => VAlign::Top,
+    };
+    let (cx, cy) = size?;
+    Some(Shape {
+        geom,
+        fill,
+        line,
+        cx,
+        cy,
+        anchor,
+        text,
+        insets: [inset("tIns", 3.6), inset("rIns", 7.2), inset("bIns", 3.6), inset("lIns", 7.2)],
+        valign,
+    })
 }
 
 /// A CSS length (`72pt`, `1in`, `2.5cm`, `96px`) in EMU.
@@ -1371,7 +2330,7 @@ pub fn normalize(runs: &[Run]) -> Vec<Run> {
     for run in runs.iter().filter(|r| !r.text.is_empty()) {
         match out.last_mut() {
             Some(last) if last.same_format(run) => last.text.push_str(&run.text),
-            _ => out.push(Run { props: String::new(), ..run.clone() }),
+            _ => out.push(Run { props: String::new(), look: None, ..run.clone() }),
         }
     }
     out
@@ -1593,24 +2552,29 @@ pub fn cp1252(b: u8) -> char {
     if (0x80..0xA0).contains(&b) { HIGH[(b - 0x80) as usize] } else { b as char }
 }
 
-/// The text of `blocks`, a line per paragraph: bullets as bullets, table
-/// cells separated by tabs, pictures and placeholders left out.
+/// The text of `blocks`, a line per paragraph: list numbers and bullets as
+/// they are shown, table cells separated by tabs, equations as text,
+/// pictures and placeholders left out.
 pub fn text_of(blocks: &[Block]) -> String {
     let mut out = String::new();
     for block in blocks {
         match block {
-            Block::Paragraph { style, runs, .. } => {
-                if let ParaStyle::ListItem(level) = style {
+            Block::Paragraph { style, runs, look, .. } => {
+                if let Some((label, _)) = &look.label {
+                    out.push_str(&"    ".repeat(look.direct.level.unwrap_or(0) as usize));
+                    out.push_str(label);
+                    out.push(' ');
+                } else if let ParaStyle::ListItem(level) = style {
                     out.push_str(&"    ".repeat(*level as usize));
                     out.push_str("• ");
                 }
-                for run in runs.iter().filter(|r| !r.placeholder && r.image.is_none()) {
+                for run in runs.iter().filter(|r| (!r.placeholder || r.math.is_some()) && r.image.is_none()) {
                     out.push_str(&run.text.replace(LINE_BREAK, "\n"));
                 }
                 out.push('\n');
             }
-            Block::Table { rows } => {
-                for row in rows {
+            Block::Table(t) => {
+                for row in t.text_rows() {
                     let cells: Vec<String> = row.iter().map(|c| c.replace('\n', " ")).collect();
                     out.push_str(&cells.join("\t"));
                     out.push('\n');
@@ -1694,6 +2658,39 @@ fn resolve(from_dir: &str, target: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// The fonts the font table embeds.
+fn embedded_fonts<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, rels: &[Rel]) -> Vec<crate::fonts::Embedded> {
+    let Some(rel) = rels.iter().find(|r| r.kind.ends_with("/fontTable") && !r.external) else { return Vec::new() };
+    let part = resolve("word", &rel.target);
+    let Some(table) = read_part(zip, &part).ok().flatten() else { return Vec::new() };
+    if !table.contains(":embed") {
+        return Vec::new();
+    }
+    let font_rels = read_part(zip, &rels_path(&part)).ok().flatten().map(|x| rels_of(&x)).unwrap_or_default();
+    let dir = part.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+    let mut out = Vec::new();
+    for (kind, font) in children(&inner_of(&table, b"fonts").unwrap_or_default()) {
+        let Some(family) = (kind == "font").then(|| attr_value(&font, "name")).flatten() else { continue };
+        for (kind, embed) in children(&inner_of(&font, b"font").unwrap_or_default()) {
+            let style = match kind.as_str() {
+                "embedRegular" => "Regular",
+                "embedBold" => "Bold",
+                "embedItalic" => "Italic",
+                "embedBoldItalic" => "Bold Italic",
+                _ => continue,
+            };
+            let (Some(id), key) = (attr_value(&embed, "id"), attr_value(&embed, "fontKey").unwrap_or_default()) else { continue };
+            let Some(rel) = font_rels.iter().find(|r| r.id == id && !r.external) else { continue };
+            let Ok(mut f) = zip.by_name(&resolve(&dir, &rel.target)) else { continue };
+            let mut data = Vec::new();
+            if f.read_to_end(&mut data).is_ok() {
+                out.push(crate::fonts::Embedded { family: family.clone(), style: style.into(), key, data });
+            }
+        }
+    }
+    out
 }
 
 fn rels_path(part: &str) -> String {
@@ -2136,7 +3133,8 @@ pub(crate) mod tests {
         assert!(runs[0].bold && !runs[1].bold);
         assert_eq!(runs[1].text, " plain & simple");
         assert!(matches!(&blocks[2], Block::Paragraph { style: ParaStyle::ListItem(1), .. }));
-        assert_eq!(blocks[3], Block::Table { rows: vec![vec!["a".into(), "b".into()]] });
+        let Block::Table(t) = &blocks[3] else { panic!() };
+        assert_eq!(t.text_rows(), vec![vec!["a".to_string(), "b".to_string()]]);
     }
 
     const NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
@@ -2163,6 +3161,29 @@ pub(crate) mod tests {
             out.write_all(v.as_bytes()).unwrap();
         }
         out.finish().unwrap().into_inner()
+    }
+
+    /// A package whose body refers to two footnotes and an endnote.
+    pub(crate) fn with_notes() -> Vec<u8> {
+        let body = r#"<w:p><w:r><w:t>Claim</w:t></w:r><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:footnoteReference w:id="2"/></w:r><w:r><w:t> and another</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:endnoteReference w:id="1"/></w:r></w:p>"#;
+        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/></Relationships>"#;
+        let foot = format!(
+            r#"<w:footnotes {NS}><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> Second note.</w:t></w:r></w:p></w:footnote><w:footnote w:id="2"><w:p><w:r><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> First note.</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+        );
+        let end = format!(r#"<w:endnotes {NS}><w:endnote w:id="1"><w:p><w:r><w:endnoteRef/></w:r><w:r><w:t xml:space="preserve"> At the end.</w:t></w:r></w:p></w:endnote></w:endnotes>"#);
+        package(body, &[("word/_rels/document.xml.rels", rels), ("word/footnotes.xml", &foot), ("word/endnotes.xml", &end)])
+    }
+
+    /// References are numbered in the order they come, and each carries
+    /// its note, which starts with the same number.
+    #[test]
+    fn notes_are_numbered_in_order() {
+        let doc = load(&with_notes()).unwrap();
+        let Some(Block::Paragraph { runs, .. }) = doc.items[0].blocks.first() else { panic!("a paragraph") };
+        let notes: Vec<(&str, bool, String)> =
+            runs.iter().filter_map(|r| r.note.as_ref().map(|n| (r.text.as_str(), n.foot, text_of(&n.blocks).trim_end().to_string()))).collect();
+        assert_eq!(notes, [("1", true, "1 First note.".to_string()), ("2", true, "2 Second note.".into()), ("i", false, "i At the end.".into())]);
+        assert_eq!(doc.items[0].kind, ItemKind::Locked, "a paragraph with notes is kept as it is");
     }
 
     fn document_xml(package: &[u8]) -> String {
@@ -2279,7 +3300,7 @@ pub(crate) mod tests {
     fn a_new_picture_becomes_part_of_the_package() {
         let png = b"\x89PNG\r\n\x1a\n new picture".to_vec();
         let doc = load(&package("<w:p/>", &[])).unwrap();
-        let picture = Image { data: Arc::new(png.clone()), cx: 100_000, cy: 50_000, origin: None };
+        let picture = Image { data: Arc::new(png.clone()), cx: 100_000, cy: 50_000, origin: None, anchor: None };
         let out = [
             Out::Para { style: ParaStyle::Normal, runs: vec![Run::picture(picture.clone())], base: Some(0) },
             Out::Block(Block::paragraph(ParaStyle::Normal, vec![Run::picture(picture)])),
@@ -2313,13 +3334,13 @@ pub(crate) mod tests {
         let built = build(&[
             Block::paragraph(ParaStyle::Heading(1), vec![Run { text: "Head".into(), ..Default::default() }]),
             Block::paragraph(ParaStyle::ListItem(0), vec![Run { text: "Item".into(), ..Default::default() }]),
-            Block::Table { rows: vec![vec!["a".into(), "b".into()]] },
+            Block::Table(Box::new(Table::of_text(vec![vec!["a".into(), "b".into()]]))),
         ], Paper::LETTER, &TextDefaults::document()).unwrap();
         let back = load(&built).unwrap();
         let xml = document_xml(&built);
         assert!(xml.contains(r#"<w:numId w:val="1"/>"#), "a real list, not a typed bullet: {xml}");
         assert_eq!(back.blocks().len(), 3);
-        assert!(matches!(back.blocks()[2], Block::Table { .. }));
+        assert!(matches!(back.blocks()[2], Block::Table(_)));
     }
 
     #[test]
@@ -2374,7 +3395,7 @@ fn docx_real() {
     for (i, item) in doc.items.iter().enumerate() {
         eprintln!("{i:2} {:?} {:?}", item.kind, item.blocks.iter().map(|b| match b {
             Block::Paragraph { style, runs, .. } => format!("{style:?} {:?}", runs.iter().map(|r| r.text.as_str()).collect::<String>()),
-            Block::Table { rows } => format!("table {rows:?}"),
+            Block::Table(t) => format!("table {:?}", t.text_rows()),
         }).collect::<Vec<_>>());
     }
     // Edit every editable paragraph's text, turn the first into a quote.

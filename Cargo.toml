@@ -37,9 +37,10 @@ quick-xml = "0.37"
 # Documents are set on paper — for PDF export — with the Pango and Cairo
 # GTK already ships: the same generation as gtk4's own, plus Cairo's PDF
 # surface and the Pango–Cairo glue that are not re-exported through it.
-# v1_16 for the PDF's bookmarks and title, v1_44 for line spacing.
+# v1_16 for the PDF's bookmarks and title; v1_50 for right, centred and
+# decimal tab stops; v1_56 to set documents in the fonts they embed.
 cairo-rs = { version = "0.21", features = ["pdf", "v1_16"] }
-pango = { version = "0.21", features = ["v1_44"] }
+pango = { version = "0.21", features = ["v1_56"] }
 pangocairo = "0.21"
 
 serde = { version = "1", features = ["derive"] }

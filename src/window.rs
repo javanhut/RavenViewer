@@ -603,7 +603,7 @@ impl Window {
             this.1.loading.set(false);
             match loaded {
                 Ok(Ok(Loaded::Pdf(bytes, info))) => this.show_pdf(path, bytes, info),
-                Ok(Ok(Loaded::Docx(doc, format))) => this.show_docx(path, doc, Some(format)),
+                Ok(Ok(Loaded::Docx(doc, format))) => this.show_docx(path, *doc, Some(format)),
                 Ok(Err(e)) => {
                     this.toast(&format!("Couldn’t open {}: {e}", display_name(&path)));
                     this.tidy_later();
@@ -787,6 +787,7 @@ impl Window {
         view.connect_problem(move |e| this.toast(e));
         let this = self.clone();
         view.connect_zoom_changed(move |_| this.sync_zoom_label());
+        view.set_dark_pages(self.0.config.borrow().dark_pages);
         self.add_docx_menu(&view);
         self.add_docx_shortcuts(&view);
         self.install_document_drop(&view);
@@ -1477,8 +1478,8 @@ impl Window {
                     Err(e) => return self.toast(&format!("Couldn’t save: {e}")),
                 },
                 Format::Pdf => {
-                    let (blocks, page) = (view.blocks(), view.page());
-                    Box::new(move || crate::render::pdf(&blocks, &page, &title))
+                    let (blocks, sections) = (view.blocks(), view.sections());
+                    Box::new(move || crate::render::pdf(&blocks, &sections, &title))
                 }
                 Format::Doc => {
                     let (blocks, page) = (view.blocks(), view.page());
@@ -1969,7 +1970,11 @@ impl Window {
             let on = !a.state().and_then(|s| s.get::<bool>()).unwrap_or(false);
             a.set_state(&on.to_variant());
             for tab in this.0.tabs.borrow().iter() {
-                this.with_tab(tab.clone()).with_pdf(|v| v.set_dark_pages(on));
+                let w = this.with_tab(tab.clone());
+                w.with_pdf(|v| v.set_dark_pages(on));
+                if let Some(v) = w.docx() {
+                    v.set_dark_pages(on);
+                }
             }
             let mut cfg = this.0.config.borrow_mut();
             cfg.dark_pages = on;
@@ -2699,7 +2704,7 @@ fn save_filters(is_pdf: bool, first: Format) -> gio::ListStore {
 
 enum Loaded {
     Pdf(Arc<Vec<u8>>, DocumentInfo),
-    Docx(docx::Docx, Format),
+    Docx(Box<docx::Docx>, Format),
 }
 
 /// Sniff the bytes, not the extension: a PDF saved as .bin still opens.
@@ -2711,7 +2716,7 @@ fn load(path: &Path) -> anyhow::Result<Loaded> {
         return Ok(Loaded::Pdf(bytes, info));
     }
     let (doc, format) = convert::open_document(&bytes)?;
-    Ok(Loaded::Docx(doc, format))
+    Ok(Loaded::Docx(Box::new(doc), format))
 }
 
 fn display_name(path: &Path) -> String {

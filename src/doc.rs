@@ -18,7 +18,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 
 use crate::cfb::{self, Cfb};
-use crate::docx::{self, Align, Block, Image, LINE_BREAK, Paper, ParaStyle, Run, TextDefaults};
+use crate::docx::{self, Align, Block, Image, LINE_BREAK, Paper, ParaStyle, Run, Table, TextDefaults};
+use crate::look::{self, Look};
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
     b.get(at..at + 2).map_or(0, |s| u16::from_le_bytes([s[0], s[1]]))
@@ -560,7 +561,7 @@ impl Reader<'_> {
             para_style = ParaStyle::ListItem(level);
         }
         runs.retain(|r| !r.text.is_empty());
-        self.blocks.push(Block::Paragraph { style: para_style, runs, align: props.align });
+        self.blocks.push(Block::Paragraph { style: para_style, runs, align: props.align, look: Default::default() });
     }
 
     fn end_table(&mut self) {
@@ -571,7 +572,7 @@ impl Reader<'_> {
             self.rows.push(std::mem::take(&mut self.cells));
         }
         if !self.rows.is_empty() {
-            self.blocks.push(Block::Table { rows: std::mem::take(&mut self.rows) });
+            self.blocks.push(Block::Table(Box::new(Table::of_text(std::mem::take(&mut self.rows)))));
         }
     }
 
@@ -718,7 +719,7 @@ fn picture(data: &[u8], at: usize) -> Option<Image> {
     let file = blip_in(data, p, end)?;
     // Twips scaled by thousandths, to EMU.
     let scale = |goal: i64, m: i64| goal.max(0) * if m == 0 { 1000 } else { m } / 1000 * 635;
-    Some(Image { data: Arc::new(file), cx: scale(goal_x, mx), cy: scale(goal_y, my), origin: None })
+    Some(Image { data: Arc::new(file), cx: scale(goal_x, mx), cy: scale(goal_y, my), origin: None, anchor: None })
 }
 
 /// The first picture file among the drawing records in `data[from..to]`.
@@ -862,63 +863,38 @@ impl Writer {
 
     fn block(&mut self, block: &Block) {
         match block {
-            Block::Paragraph { style, runs, align } => {
-                let istd = match style {
-                    ParaStyle::Title => ISTD_TITLE,
-                    ParaStyle::Heading(n) => (*n).clamp(1, 6) as u16,
-                    ParaStyle::Quote => ISTD_QUOTE,
-                    _ => 0,
-                };
-                let mut grpprl = Vec::new();
-                let jc = match align {
-                    Align::Start => None,
-                    Align::Center => Some(1),
-                    Align::End => Some(2),
-                    Align::Justify => Some(3),
-                };
-                if let Some(jc) = jc {
-                    sprm(&mut grpprl, 0x2403, &[jc]);
-                }
-                if let ParaStyle::Heading(n) = style {
-                    sprm(&mut grpprl, 0x2640, &[(*n).clamp(1, 9) - 1]);
-                }
-                if let ParaStyle::ListItem(level) = style {
-                    let indent = LIST_INDENT * (*level as i16 + 1);
-                    sprm(&mut grpprl, 0x840F, &indent.to_le_bytes());
-                    sprm(&mut grpprl, 0x8411, &(-LIST_INDENT).to_le_bytes());
-                    let bullet = ["•\t", "◦\t", "▪\t"][*level as usize % 3];
-                    self.push(&bullet.encode_utf16().collect::<Vec<_>>(), Vec::new());
-                }
-                for run in runs {
-                    if let Some(image) = &run.image {
-                        self.picture(image);
-                    } else if run.is_page_break() {
-                        self.push(&[0x0C], Vec::new());
-                    } else if !run.placeholder {
-                        let units = units_of(&run.text);
-                        let props = self.chpx(run);
-                        self.push(&units, props);
-                    }
-                }
-                self.end_paragraph(0x0D, istd, grpprl, false);
-            }
-            Block::Table { rows } => {
-                let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+            Block::Paragraph { style, runs, align, look } => self.paragraph(*style, runs, *align, look, None),
+            Block::Table(t) => {
+                let cols = t.columns();
                 if cols == 0 {
                     return;
                 }
                 let mut cell_props = Vec::new();
                 sprm(&mut cell_props, 0x2416, &[1]);
                 sprm(&mut cell_props, 0x6649, &1u32.to_le_bytes());
-                for row in rows {
-                    for c in 0..cols {
-                        let cell = row.get(c).map_or("", String::as_str);
-                        let lines: Vec<&str> = cell.split('\n').collect();
-                        for (k, line) in lines.iter().enumerate() {
-                            self.push(&units_of(line), Vec::new());
-                            let mark = if k + 1 == lines.len() { 0x07 } else { 0x0D };
-                            self.end_paragraph(mark, 0, cell_props.clone(), true);
+                for row in &t.rows {
+                    let mut col = 0;
+                    for cell in row {
+                        // Word 97 cells are one grid column each; a spanning
+                        // cell's content goes in the first, the rest stay empty.
+                        let paragraphs: Vec<&Block> = if cell.merged { Vec::new() } else { flatten(&cell.blocks) };
+                        if paragraphs.is_empty() {
+                            self.end_paragraph(0x07, 0, cell_props.clone(), true);
                         }
+                        for (k, block) in paragraphs.iter().enumerate() {
+                            let mark = if k + 1 == paragraphs.len() { 0x07 } else { 0x0D };
+                            if let Block::Paragraph { style, runs, align, look } = block {
+                                self.paragraph(*style, runs, *align, look, Some((mark, cell_props.clone())));
+                            }
+                        }
+                        for _ in 1..cell.span.max(1) {
+                            self.end_paragraph(0x07, 0, cell_props.clone(), true);
+                        }
+                        col += cell.span.max(1);
+                    }
+                    while col < cols {
+                        self.end_paragraph(0x07, 0, cell_props.clone(), true);
+                        col += 1;
                     }
                     let mut row_props = cell_props.clone();
                     sprm(&mut row_props, 0x2417, &[1]);
@@ -926,6 +902,80 @@ impl Writer {
                     self.end_paragraph(0x07, 0, row_props, true);
                 }
             }
+        }
+    }
+
+    /// A paragraph — or, `in_cell`, one ending a table cell's paragraph
+    /// with that mark and those properties.
+    fn paragraph(&mut self, style: ParaStyle, runs: &[Run], align: Align, look: &Look, in_cell: Option<(u16, Vec<u8>)>) {
+        let istd = match style {
+            ParaStyle::Title => ISTD_TITLE,
+            ParaStyle::Heading(n) => n.clamp(1, 6) as u16,
+            ParaStyle::Quote => ISTD_QUOTE,
+            _ => 0,
+        };
+        let mut grpprl = in_cell.as_ref().map(|(_, p)| p.clone()).unwrap_or_default();
+        let jc = match align {
+            Align::Start => None,
+            Align::Center => Some(1),
+            Align::End => Some(2),
+            Align::Justify => Some(3),
+        };
+        if let Some(jc) = jc {
+            sprm(&mut grpprl, 0x2403, &[jc]);
+        }
+        if let ParaStyle::Heading(n) = style {
+            sprm(&mut grpprl, 0x2640, &[n.clamp(1, 9) - 1]);
+        }
+        let tw = |pt: f64| (pt * 20.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        if look.resolved {
+            // The paragraph as it looks: its style's spacing and indents
+            // written out, since the styles written here are not its own.
+            sprm(&mut grpprl, 0xA413, &(tw(look.before).max(0) as u16).to_le_bytes());
+            sprm(&mut grpprl, 0xA414, &(tw(look.after).max(0) as u16).to_le_bytes());
+            sprm(&mut grpprl, 0x840F, &tw(look.left).to_le_bytes());
+            sprm(&mut grpprl, 0x840E, &tw(look.right).to_le_bytes());
+            sprm(&mut grpprl, 0x8411, &tw(look.first).to_le_bytes());
+            let (line, multiple) = match look.line {
+                look::Line::Auto(m) => ((m * 240.0).round() as i16, 1u16),
+                look::Line::AtLeast(pt) => (tw(pt), 0),
+                look::Line::Exact(pt) => (-tw(pt), 0),
+            };
+            let mut lspd = line.to_le_bytes().to_vec();
+            lspd.extend_from_slice(&multiple.to_le_bytes());
+            sprm(&mut grpprl, 0x6412, &lspd);
+            if look.keep_next {
+                sprm(&mut grpprl, 0x2406, &[1]);
+            }
+            if let Some((label, label_look)) = &look.label {
+                let units: Vec<u16> = format!("{label}\t").encode_utf16().collect();
+                let props = self.chpx_of(label_look);
+                self.push(&units, props);
+            }
+        } else if let ParaStyle::ListItem(level) = style {
+            let indent = LIST_INDENT * (level as i16 + 1);
+            sprm(&mut grpprl, 0x840F, &indent.to_le_bytes());
+            sprm(&mut grpprl, 0x8411, &(-LIST_INDENT).to_le_bytes());
+            let bullet = ["•\t", "◦\t", "▪\t"][level as usize % 3];
+            self.push(&bullet.encode_utf16().collect::<Vec<_>>(), Vec::new());
+        }
+        for run in runs {
+            if let Some(image) = &run.image {
+                self.picture(image);
+            } else if run.is_page_break() {
+                self.push(&[0x0C], Vec::new());
+            } else if !run.placeholder || run.math.is_some() {
+                let units = units_of(&run.text);
+                let props = match &run.look {
+                    Some(l) => self.chpx_of(l),
+                    None => self.chpx(run),
+                };
+                self.push(&units, props);
+            }
+        }
+        match in_cell {
+            Some((mark, _)) => self.end_paragraph(mark, istd, grpprl, true),
+            None => self.end_paragraph(0x0D, istd, grpprl, false),
         }
     }
 
@@ -991,6 +1041,39 @@ impl Writer {
         if let Some([r, gr, b]) = docx::run_prop(&run.props, "color").and_then(|v| docx::hex_color(&v)) {
             let cv = (r >> 8) as u32 | ((gr >> 8) as u32) << 8 | ((b >> 8) as u32) << 16;
             sprm(&mut g, 0x6870, &cv.to_le_bytes());
+        }
+        g
+    }
+
+    /// A run's whole look, written out: every property, on or off, since
+    /// the styles it came from are not written.
+    fn chpx_of(&mut self, l: &look::RunLook) -> Vec<u8> {
+        let mut g = Vec::new();
+        sprm(&mut g, 0x0835, &[l.bold as u8]);
+        sprm(&mut g, 0x0836, &[l.italic as u8]);
+        sprm(&mut g, 0x0837, &[l.strike as u8]);
+        sprm(&mut g, 0x083B, &[l.caps as u8]);
+        sprm(&mut g, 0x083A, &[l.small_caps as u8]);
+        sprm(&mut g, 0x2A3E, &[l.underline as u8]);
+        if let Some(c) = l.highlight {
+            sprm(&mut g, 0x2A0C, &[nearest_ico(c)]);
+        }
+        let f = self.font(&l.font).to_le_bytes();
+        for code in [0x4A4F, 0x4A50, 0x4A51] {
+            sprm(&mut g, code, &f);
+        }
+        let size = ((l.size * 2.0).round() as u16).max(2);
+        sprm(&mut g, 0x4A43, &size.to_le_bytes());
+        sprm(&mut g, 0x4A61, &size.to_le_bytes());
+        let cv = match l.color {
+            Some([r, gr, b]) => r as u32 | (gr as u32) << 8 | (b as u32) << 16,
+            None => 0xFF00_0000,
+        };
+        sprm(&mut g, 0x6870, &cv.to_le_bytes());
+        match l.vert {
+            look::Vert::Super => sprm(&mut g, 0x2A48, &[1]),
+            look::Vert::Sub => sprm(&mut g, 0x2A48, &[2]),
+            look::Vert::Baseline => {}
         }
         g
     }
@@ -1207,6 +1290,34 @@ impl Writer {
         }
         Ok(cfb::write(&streams))
     }
+}
+
+/// The paragraphs of a cell, tables inside it read out paragraph by
+/// paragraph: a Word 97 file here holds tables one deep.
+fn flatten(blocks: &[Block]) -> Vec<&Block> {
+    let mut out = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Paragraph { .. } => out.push(b),
+            Block::Table(t) => {
+                for cell in t.rows.iter().flatten() {
+                    out.extend(flatten(&cell.blocks));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The highlight colour Word 97 has nearest to `c`.
+fn nearest_ico(c: [u8; 3]) -> u8 {
+    const ICO: [(u8, [u8; 3]); 15] = [
+        (1, [0, 0, 0]), (2, [0, 0, 255]), (3, [0, 255, 255]), (4, [0, 255, 0]), (5, [255, 0, 255]), (6, [255, 0, 0]),
+        (7, [255, 255, 0]), (8, [255, 255, 255]), (9, [0, 0, 128]), (10, [0, 128, 128]), (11, [0, 128, 0]),
+        (12, [128, 0, 128]), (13, [128, 0, 0]), (14, [128, 128, 0]), (15, [192, 192, 192]),
+    ];
+    let d = |a: [u8; 3]| (0..3).map(|i| (a[i] as i32 - c[i] as i32).pow(2)).sum::<i32>();
+    ICO.iter().min_by_key(|(_, rgb)| d(*rgb)).map_or(7, |(i, _)| *i)
 }
 
 /// Text as UTF-16 for the document: tabs and line breaks as Word writes
@@ -1488,7 +1599,7 @@ mod tests {
         let r = |text: &str| Run { text: text.into(), ..Default::default() };
         let mut big = r("big red");
         big.props = r#"<w:rFonts w:ascii="Georgia" w:hAnsi="Georgia"/><w:color w:val="C00000"/><w:sz w:val="36"/>"#.into();
-        let picture = Image { data: std::sync::Arc::new(png()), cx: 914_400, cy: 457_200, origin: None };
+        let picture = Image { data: std::sync::Arc::new(png()), cx: 914_400, cy: 457_200, origin: None, anchor: None };
         let mut long = String::new();
         for i in 0..400 {
             long.push_str(&format!("word{i} "));
@@ -1496,14 +1607,14 @@ mod tests {
         let blocks = vec![
             Block::paragraph(ParaStyle::Title, vec![r("The Title")]),
             Block::paragraph(ParaStyle::Heading(1), vec![r("Chapter — ünïcödé 中文")]),
-            Block::Paragraph { style: ParaStyle::Normal, align: Align::Center, runs: vec![
+            Block::Paragraph { style: ParaStyle::Normal, align: Align::Center, look: Default::default(), runs: vec![
                 r("plain "), Run { bold: true, ..r("bold") }, r(" "), Run { italic: true, underline: true, ..r("both") },
                 r(" "), Run { highlight: true, ..r("marked") }, r(" "), big,
             ] },
             Block::paragraph(ParaStyle::ListItem(0), vec![r("first")]),
             Block::paragraph(ParaStyle::ListItem(1), vec![r("nested")]),
             Block::paragraph(ParaStyle::Quote, vec![r("quoted")]),
-            Block::Table { rows: vec![vec!["a".into(), "b\nc".into()], vec!["1".into(), "2".into()]] },
+            Block::Table(Box::new(Table::of_text(vec![vec!["a".into(), "b\nc".into()], vec!["1".into(), "2".into()]]))),
             Block::paragraph(ParaStyle::Normal, vec![r("before"), Run::picture(picture), r("after")]),
             Block::paragraph(ParaStyle::Normal, vec![r(&long)]),
             Block::paragraph(ParaStyle::Normal, vec![r("x"), Run::page_break(), r("y")]),
@@ -1516,7 +1627,7 @@ mod tests {
         assert_eq!(back.text.font, "Calibri");
         let text = |b: &Block| match b {
             Block::Paragraph { runs, .. } => runs.iter().filter(|r| r.image.is_none() && !r.placeholder).map(|r| r.text.as_str()).collect::<String>(),
-            Block::Table { rows } => format!("{rows:?}"),
+            Block::Table(t) => format!("{:?}", t.text_rows()),
         };
         let style = |b: &Block| match b {
             Block::Paragraph { style, .. } => Some(*style),
@@ -1555,16 +1666,17 @@ fn doc_real() {
     eprintln!("paper {:?}, text {:?}", read.paper, read.text);
     for b in &read.blocks {
         match b {
-            Block::Paragraph { style, runs, align } => eprintln!("{style:?} {align:?} {:?}", runs.iter().map(|r| {
+            Block::Paragraph { style, runs, align, .. } => eprintln!("{style:?} {align:?} {:?}", runs.iter().map(|r| {
                 if let Some(i) = &r.image { format!("<image {} bytes {}x{}>", i.data.len(), i.cx, i.cy) }
                 else { format!("{}{}{}{}[{}]", if r.bold {"*"} else {""}, if r.italic {"/"} else {""}, if r.underline {"_"} else {""}, r.text, r.props) }
             }).collect::<Vec<_>>()),
-            Block::Table { rows } => eprintln!("table {rows:?}"),
+            Block::Table(t) => eprintln!("table {:?}", t.text_rows()),
         }
     }
     let built = docx::build(&read.blocks, read.paper, &read.text).unwrap();
-    let page = docx::load(&built).unwrap().page;
-    std::fs::write(format!("{path}.pdf"), crate::render::pdf(&read.blocks, &page, "test").unwrap()).unwrap();
+    let loaded = docx::load(&built).unwrap();
+    let page = loaded.page.clone();
+    std::fs::write(format!("{path}.pdf"), crate::render::pdf(&loaded.blocks(), &loaded.sections, "test").unwrap()).unwrap();
     std::fs::write(format!("{path}.docx"), built).unwrap();
     std::fs::write(format!("{path}.written.doc"), write(&read.blocks, &page).unwrap()).unwrap();
 }

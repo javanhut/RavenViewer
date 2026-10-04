@@ -49,14 +49,24 @@ const VIEWER_CSS: &str = r#"
 .outline-row.level-3 { padding-left: 50px; }
 .annot-kind { font-size: 11px; font-weight: 700; letter-spacing: 0.4px; color: @accent_bg_color; }
 .docx-view { background-color: transparent; }
+/* A document is shown as the paper it is printed on: white, its own
+   colours on it. Dark Pages turns it, like a PDF's pages. */
 .docx-sheet {
-  background-color: @view_bg_color;
-  border-radius: 14px;
-  border: 1px solid alpha(#ffffff, 0.08);
-  padding: 48px 56px;
+  background-color: #ffffff;
+  color: #1b1b1f;
+  border-radius: 4px;
+  border: 1px solid alpha(#000000, 0.12);
+  box-shadow: 0 1px 2px alpha(#000000, 0.30), 0 8px 24px alpha(#000000, 0.28);
+  padding: 56px 64px;
 }
-.docx-sheet textview, .docx-sheet textview text { background-color: transparent; }
-.docx-sheet.editing { border-color: alpha(@accent_bg_color, 0.55); }
+.docx-sheet textview, .docx-sheet textview text { background-color: transparent; color: #1b1b1f; }
+.docx-sheet textview text selection { background-color: alpha(@accent_bg_color, 0.30); color: #1b1b1f; }
+.docx-sheet.editing { border-color: alpha(@accent_bg_color, 0.75); }
+.docx-sheet.dark-page { filter: invert(0.88) hue-rotate(180deg); }
+.docx-sheet label { color: #1b1b1f; }
+.docx-table.bordered { border-top: 1px solid #3a3a3a; border-left: 1px solid #3a3a3a; }
+.docx-table.bordered > .docx-cell { border-right: 1px solid #3a3a3a; border-bottom: 1px solid #3a3a3a; }
+.docx-cell { padding: 2px 6px; }
 .format-bar { padding: 4px 8px; }
 /* Split view: the side the header and the shortcuts act on. */
 .doc-group.focused > tabbar { box-shadow: inset 0 -2px alpha(@accent_bg_color, 0.85); }

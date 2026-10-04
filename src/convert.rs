@@ -108,7 +108,7 @@ pub fn open_document(bytes: &[u8]) -> Result<(Docx, Format)> {
 /// A document's whole content written as `to`.
 pub fn write(doc: &Docx, blocks: &[docx::Block], to: Format, title: &str) -> Result<Vec<u8>> {
     match to {
-        Format::Pdf => render::pdf(blocks, &doc.page, title),
+        Format::Pdf => render::pdf(blocks, &doc.sections, title),
         Format::Text => Ok(docx::text_of(blocks).into_bytes()),
         Format::Doc => doc::write(blocks, &doc.page),
         Format::Docx => {
