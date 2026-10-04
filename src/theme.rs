@@ -58,6 +58,8 @@ const VIEWER_CSS: &str = r#"
 .docx-sheet textview, .docx-sheet textview text { background-color: transparent; }
 .docx-sheet.editing { border-color: alpha(@accent_bg_color, 0.55); }
 .format-bar { padding: 4px 8px; }
+/* Split view: the side the header and the shortcuts act on. */
+.doc-group.focused > tabbar { box-shadow: inset 0 -2px alpha(@accent_bg_color, 0.85); }
 .format-bar .bold-label { font-weight: 800; }
 .format-bar .italic-label { font-style: italic; font-family: serif; }
 .format-bar .underline-label { text-decoration: underline; }

@@ -6,18 +6,154 @@
 //! save every line of the buffer can be traced to the paragraph it came from:
 //! unchanged ones are written back as they were, edited ones are rewritten
 //! from that original, and lines with no origin are new. Tables and
-//! paragraphs holding what cannot be edited as text (images, equations,
-//! fields) are shown but not editable, so they cannot be damaged.
+//! paragraphs holding what cannot be edited as text (equations, fields,
+//! charts) are shown but not editable, so they cannot be damaged.
+//!
+//! Pictures sit in the text as paintables that carry the picture itself, so
+//! they can be typed around, deleted, cut and pasted like a character, and
+//! are read back from wherever they end up. New ones come from a file, the
+//! clipboard or a drop.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
-use gtk4::{gdk, glib};
+use gtk4::{gdk, gio, glib};
 use libadwaita as adw;
 
-use crate::docx::{Block, Docx, ItemKind, LINE_BREAK, Out, ParaStyle, Run, normalize};
+use crate::history::History;
+use crate::docx::{self, Align, Block, Docx, Image, ItemKind, LINE_BREAK, Out, PageSetup, ParaStyle, Run, normalize};
+
+pub use picture::Picture;
+
+mod picture {
+    use std::cell::{Cell, OnceCell};
+
+    use gtk4 as gtk;
+    use gtk4::prelude::*;
+    use gtk4::subclass::prelude::*;
+    use gtk4::{gdk, glib, graphene, gsk};
+
+    use crate::docx::{EMU_PER_INCH, Image};
+
+    /// Pictures are shown no wider than the sheet's text.
+    const MAX_WIDTH: f64 = 680.0;
+
+    mod imp {
+        use super::*;
+
+        #[derive(Default)]
+        pub struct Picture {
+            pub image: OnceCell<Image>,
+            /// Decoded when first drawn; `None` for what cannot be (a
+            /// metafile), which is drawn as a frame of its size.
+            pub texture: OnceCell<Option<gdk::Texture>>,
+            /// Its size at actual size, and the zoom it is shown at.
+            pub size: Cell<(i32, i32)>,
+            pub zoom: Cell<f64>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for Picture {
+            const NAME: &'static str = "RavenPicture";
+            type Type = super::Picture;
+            type Interfaces = (gdk::Paintable,);
+        }
+
+        impl ObjectImpl for Picture {}
+
+        impl Picture {
+            fn zoom(&self) -> f64 {
+                let z = self.zoom.get();
+                if z > 0.0 { z } else { 1.0 }
+            }
+        }
+
+        impl PaintableImpl for Picture {
+            fn intrinsic_width(&self) -> i32 {
+                (self.size.get().0 as f64 * self.zoom()).round() as i32
+            }
+
+            fn intrinsic_height(&self) -> i32 {
+                (self.size.get().1 as f64 * self.zoom()).round() as i32
+            }
+
+            fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+                let Some(snapshot) = snapshot.downcast_ref::<gtk::Snapshot>() else { return };
+                let rect = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+                match self.obj().texture() {
+                    Some(t) => snapshot.append_scaled_texture(&t, gsk::ScalingFilter::Trilinear, &rect),
+                    None => {
+                        snapshot.append_color(&gdk::RGBA::new(0.55, 0.57, 0.65, 0.18), &rect);
+                        let border = gsk::RoundedRect::from_rect(rect, 0.0);
+                        let color = gdk::RGBA::new(0.55, 0.57, 0.65, 0.6);
+                        snapshot.append_border(&border, &[1.0; 4], &[color; 4]);
+                    }
+                }
+            }
+        }
+    }
+
+    glib::wrapper! {
+        /// A picture in the text, carrying the picture it shows.
+        pub struct Picture(ObjectSubclass<imp::Picture>) @implements gdk::Paintable;
+    }
+
+    impl Picture {
+        pub fn new(image: Image) -> Self {
+            Self::with_texture(image, None)
+        }
+
+        /// A picture whose texture is already decoded.
+        pub fn with_texture(image: Image, texture: Option<gdk::Texture>) -> Self {
+            let obj: Self = glib::Object::new();
+            let imp = obj.imp();
+            if let Some(t) = texture {
+                let _ = imp.texture.set(Some(t));
+            }
+            // Its size on the page at 96 dpi, or else its pixels; shrunk to
+            // the sheet.
+            let (mut w, mut h) = if image.cx > 0 && image.cy > 0 {
+                let px = |emu: i64| emu as f64 * 96.0 / EMU_PER_INCH as f64;
+                (px(image.cx), px(image.cy))
+            } else {
+                let _ = imp.image.set(image.clone());
+                obj.texture().map_or((96.0, 96.0), |t| (t.width() as f64, t.height() as f64))
+            };
+            if w > MAX_WIDTH {
+                h *= MAX_WIDTH / w;
+                w = MAX_WIDTH;
+            }
+            imp.size.set(((w.round() as i32).max(8), (h.round() as i32).max(8)));
+            let _ = imp.image.set(image);
+            obj
+        }
+
+        /// Show the picture at a zoom, as the text around it is.
+        pub fn set_zoom(&self, zoom: f64) {
+            self.imp().zoom.set(zoom);
+            self.invalidate_size();
+        }
+
+        pub fn image(&self) -> Image {
+            self.imp().image.get().cloned().unwrap_or_else(|| Image { data: Default::default(), cx: 0, cy: 0, origin: None })
+        }
+
+        fn texture(&self) -> Option<gdk::Texture> {
+            let imp = self.imp();
+            imp.texture
+                .get_or_init(|| {
+                    let data = &imp.image.get()?.data;
+                    if data.is_empty() {
+                        return None;
+                    }
+                    gdk::Texture::from_bytes(&glib::Bytes::from(&data[..])).ok()
+                })
+                .clone()
+        }
+    }
+}
 
 const BULLET_TAG: &str = "bullet";
 const LOCKED_TAG: &str = "locked";
@@ -78,9 +214,35 @@ struct Inner {
     /// Formatting chosen with nothing selected, for the next thing typed.
     typing: Cell<Option<Inline>>,
     on_format: RefCell<Option<FormatListener>>,
+    on_problem: RefCell<Option<ProblemListener>>,
+    /// Undo and redo, pictures and formatting included; from after the
+    /// document was laid out.
+    history: OnceCell<History>,
+    clamp: adw::Clamp,
+    /// How big the sheet is shown: 1.0 is actual size.
+    zoom: Cell<f64>,
+    /// Sets this view's text size for its zoom.
+    zoom_css: gtk::CssProvider,
+    on_zoom: RefCell<Option<ZoomListener>>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_remove_provider_for_display(&display, &self.zoom_css);
+        }
+    }
+}
+
+/// The sheet's widest at actual size, and where it starts to narrow.
+const SHEET_WIDTH: f64 = 820.0;
+const SHEET_TIGHTENING: f64 = 600.0;
+const MIN_ZOOM: f64 = 0.5;
+const MAX_ZOOM: f64 = 4.0;
+
 type FormatListener = Box<dyn Fn(ParaStyle, Inline)>;
+type ProblemListener = Box<dyn Fn(&str)>;
+type ZoomListener = Box<dyn Fn(f64)>;
 
 #[derive(Clone)]
 pub struct DocxView {
@@ -101,13 +263,29 @@ impl DocxView {
         let sheet = gtk::Box::builder().css_classes(["docx-sheet"]).margin_top(28).margin_bottom(28).build();
         sheet.append(&view);
         view.set_hexpand(true);
-        let clamp = adw::Clamp::builder().maximum_size(820).tightening_threshold(600).child(&sheet).build();
+        let clamp = adw::Clamp::builder()
+            .maximum_size(SHEET_WIDTH as i32)
+            .tightening_threshold(SHEET_TIGHTENING as i32)
+            .child(&sheet)
+            .build();
+        // Scrollbars that stay: a sheet zoomed wider than the window is
+        // scrolled sideways, and a hidden scrollbar is no help with that.
         let widget = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
+            .overlay_scrolling(false)
             .css_classes(["canvas", "docx-view"])
             .child(&clamp)
             .build();
+
+        // The text's size follows the zoom through a stylesheet of the
+        // view's own, by its name.
+        static NEXT_VIEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        view.set_widget_name(&format!("docx-{}", NEXT_VIEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let zoom_css = gtk::CssProvider::new();
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(&display, &zoom_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+        }
 
         let this = DocxView {
             inner: Rc::new(Inner {
@@ -120,10 +298,19 @@ impl DocxView {
                 inserting_into: Cell::new(ParaStyle::Normal),
                 typing: Cell::new(None),
                 on_format: RefCell::new(None),
+                on_problem: RefCell::new(None),
+                history: OnceCell::new(),
+                clamp,
+                zoom: Cell::new(1.0),
+                zoom_css,
+                on_zoom: RefCell::new(None),
             }),
         };
         this.fill();
+        let _ = this.inner.history.set(History::attach(&this.inner.buffer));
         this.connect_editing();
+        this.connect_paste();
+        this.connect_zoom();
         this
     }
 
@@ -147,6 +334,40 @@ impl DocxView {
             self.inner.view.grab_focus();
         } else {
             self.inner.sheet.remove_css_class("editing");
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.inner.history.get().is_some_and(History::can_undo)
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.inner.history.get().is_some_and(History::can_redo)
+    }
+
+    pub fn undo(&self) {
+        self.replay(History::undo);
+    }
+
+    pub fn redo(&self) {
+        self.replay(History::redo);
+    }
+
+    /// Play history back without the edit handlers reshaping what it puts
+    /// back: it is already as it was.
+    fn replay(&self, f: impl FnOnce(&History)) {
+        let Some(history) = self.inner.history.get() else { return };
+        let was_quiet = self.inner.quiet.replace(true);
+        f(history);
+        self.inner.quiet.set(was_quiet);
+        self.inner.typing.set(None);
+        self.report_format();
+    }
+
+    /// Fired when what can be undone or redone changes.
+    pub fn connect_history_changed(&self, f: impl Fn() + 'static) {
+        if let Some(history) = self.inner.history.get() {
+            history.connect_changed(f);
         }
     }
 
@@ -177,7 +398,7 @@ impl DocxView {
             let from = buffer.create_mark(None, &start, true);
             for block in &item.blocks {
                 match block {
-                    Block::Paragraph { style, runs } => append_paragraph(buffer, *style, runs),
+                    Block::Paragraph { style, runs, align } => append_paragraph(buffer, *style, runs, *align),
                     Block::Table { rows } => {
                         let mut end = buffer.end_iter();
                         let anchor = buffer.create_child_anchor(&mut end);
@@ -239,7 +460,7 @@ impl DocxView {
         }
 
         let original = |i: usize| match doc.items[i].blocks.first() {
-            Some(Block::Paragraph { style, runs }) => Some((*style, normalize(runs))),
+            Some(Block::Paragraph { style, runs, .. }) => Some((*style, normalize(runs))),
             _ => None,
         };
         let same = |line: &Line, i: usize| {
@@ -296,6 +517,102 @@ impl DocxView {
 
     pub fn save(&self) -> anyhow::Result<Vec<u8>> {
         self.inner.doc.save(&self.to_out())
+    }
+
+    /// The document as it now reads, for setting on paper or saving as text.
+    pub fn blocks(&self) -> Vec<Block> {
+        self.inner.doc.blocks_of(&self.to_out())
+    }
+
+    pub fn page(&self) -> PageSetup {
+        self.inner.doc.page.clone()
+    }
+
+    // ── Pictures ────────────────────────────────────────────────────────
+
+    /// Put a picture file in at the cursor, in place of any selection. Kinds
+    /// Word cannot show are turned into PNG.
+    pub fn insert_picture(&self, data: Vec<u8>) -> Result<(), String> {
+        let texture = gdk::Texture::from_bytes(&glib::Bytes::from(&data[..]))
+            .map_err(|_| "That file isn’t a picture Raven Viewer can read".to_string())?;
+        let data = if docx::picture_type(&data).is_some() { data } else { texture.save_to_png_bytes().to_vec() };
+        let image = Image::new(data, (texture.width(), texture.height()), self.inner.doc.text_width_emu());
+        let picture = Picture::with_texture(image, Some(texture));
+        picture.set_zoom(self.zoom());
+
+        let (view, buffer) = (&self.inner.view, &self.inner.buffer);
+        buffer.begin_user_action();
+        buffer.delete_selection(true, view.is_editable());
+        let mut at = buffer.iter_at_mark(&buffer.get_insert());
+        if !at.can_insert(view.is_editable()) {
+            buffer.end_user_action();
+            return Err("A picture can’t go here — this part of the document can’t be edited".into());
+        }
+        let line = at.line();
+        let style = style_at_line(buffer, line);
+        buffer.insert_paintable(&mut at, &picture);
+        self.restyle_lines(line, line, style);
+        buffer.end_user_action();
+        buffer.set_modified(true);
+        view.grab_focus();
+        Ok(())
+    }
+
+    /// Paste a picture rather than text when the clipboard holds one and no
+    /// text — a screenshot, a picture copied from a browser — or holds only
+    /// picture files.
+    fn connect_paste(&self) {
+        let weak = Rc::downgrade(&self.inner);
+        self.inner.view.connect_paste_clipboard(move |tv| {
+            let Some(inner) = weak.upgrade() else { return };
+            let clipboard = tv.clipboard();
+            let formats = clipboard.formats();
+            let types = formats.mime_types();
+            let has_text = types.iter().any(|m| m.starts_with("text/plain")) || formats.contains_type(glib::GString::static_type());
+            let has_files = formats.contains_type(gdk::FileList::static_type());
+            let has_image = formats.contains_type(gdk::Texture::static_type()) || types.iter().any(|m| m.starts_with("image/"));
+            if !(has_files || (has_image && !has_text)) {
+                return;
+            }
+            tv.stop_signal_emission_by_name("paste-clipboard");
+            let this = DocxView { inner };
+            glib::spawn_future_local(async move {
+                let tv = this.inner.view.clone();
+                if has_files
+                    && let Ok(value) = clipboard.read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT).await
+                    && let Ok(list) = value.get::<gdk::FileList>()
+                {
+                    let files: Vec<std::path::PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
+                    if !files.is_empty() && files.iter().all(|p| is_picture_file(p)) {
+                        for path in files {
+                            match std::fs::read(&path) {
+                                Ok(data) => this.report(this.insert_picture(data)),
+                                Err(e) => this.report(Err(format!("Couldn’t read {}: {e}", path.display()))),
+                            }
+                        }
+                        return;
+                    }
+                    // Files that are not pictures paste as their names.
+                    tv.buffer().paste_clipboard(&clipboard, None, tv.is_editable());
+                    return;
+                }
+                match read_picture(&clipboard).await {
+                    Some(data) => this.report(this.insert_picture(data)),
+                    None => tv.buffer().paste_clipboard(&clipboard, None, tv.is_editable()),
+                }
+            });
+        });
+    }
+
+    /// Where problems with pictures are told.
+    pub fn connect_problem(&self, f: impl Fn(&str) + 'static) {
+        *self.inner.on_problem.borrow_mut() = Some(Box::new(f));
+    }
+
+    fn report(&self, result: Result<(), String>) {
+        if let (Err(e), Some(f)) = (result, self.inner.on_problem.borrow().as_ref()) {
+            f(&e);
+        }
     }
 
     // ── Editing ─────────────────────────────────────────────────────────
@@ -444,6 +761,17 @@ impl DocxView {
         // every iterator.
         let (first, last) = (start.line(), end.line());
         let carried = !end.ends_line();
+        // Lines the insertion made are new paragraphs, saved without the
+        // alignment of the one they were split from; shown so too.
+        if last > first
+            && let Some(from) = buffer.iter_at_line(first + 1)
+        {
+            let mut to = buffer.iter_at_line(last).unwrap_or(buffer.end_iter());
+            to.forward_to_line_end();
+            for name in ALIGN_TAGS {
+                buffer.remove_tag_by_name(name, &from, &to);
+            }
+        }
         self.restyle_lines(first, first, style);
         if last > first {
             let next = match style {
@@ -570,6 +898,15 @@ impl DocxView {
         if self.inner.on_format.borrow().is_none() {
             return;
         }
+        let (style, inline) = self.format();
+        if let Some(cb) = self.inner.on_format.borrow().as_ref() {
+            cb(style, inline);
+        }
+    }
+
+    /// The paragraph style and the character formatting at the cursor (or
+    /// over the selection).
+    pub fn format(&self) -> (ParaStyle, Inline) {
         let buffer = &self.inner.buffer;
         let at = buffer.iter_at_mark(&buffer.get_insert());
         let inline = self.inner.typing.get().unwrap_or_else(|| match buffer.selection_bounds() {
@@ -583,10 +920,109 @@ impl DocxView {
                 if !at.starts_line() && probe.backward_char() { Inline::of(&probe.tags()) } else { Inline::of(&at.tags()) }
             }
         });
-        if let Some(cb) = self.inner.on_format.borrow().as_ref() {
-            cb(style_at_line(buffer, at.line()), inline);
+        (style_at_line(buffer, at.line()), inline)
+    }
+
+    // ── Zoom ────────────────────────────────────────────────────────────
+
+    pub fn zoom(&self) -> f64 {
+        self.inner.zoom.get()
+    }
+
+    /// Show the sheet bigger or smaller: its text, its pictures and its
+    /// width. Zoomed in past the window's width, the sheet keeps its width
+    /// and is scrolled sideways rather than reflowed.
+    pub fn set_zoom(&self, zoom: f64) {
+        let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        if (zoom - self.zoom()).abs() < 1e-3 {
+            return;
+        }
+        // Keep the place being read where it is on screen.
+        let vadj = self.inner.widget.vadjustment();
+        let fraction = if vadj.upper() > 0.0 { (vadj.value() + vadj.page_size() / 2.0) / vadj.upper() } else { 0.0 };
+
+        self.inner.zoom.set(zoom);
+        let name = self.inner.view.widget_name();
+        self.inner.zoom_css.load_from_string(&format!("textview#{name} {{ font-size: {:.1}%; }}", zoom * 100.0));
+        let inner = &self.inner;
+        inner.clamp.set_maximum_size((SHEET_WIDTH * zoom).round() as i32);
+        inner.clamp.set_tightening_threshold((SHEET_TIGHTENING * zoom).round() as i32);
+        inner.sheet.set_width_request(if zoom > 1.0 { (SHEET_WIDTH * zoom).round() as i32 } else { -1 });
+        let mut at = inner.buffer.start_iter();
+        loop {
+            if let Some(picture) = at.paintable().and_downcast::<Picture>() {
+                picture.set_zoom(zoom);
+            }
+            if !at.forward_char() {
+                break;
+            }
+        }
+        let weak = Rc::downgrade(&self.inner);
+        glib::idle_add_local_once(move || {
+            if let Some(inner) = weak.upgrade() {
+                let vadj = inner.widget.vadjustment();
+                vadj.set_value(fraction * vadj.upper() - vadj.page_size() / 2.0);
+            }
+        });
+        if let Some(cb) = self.inner.on_zoom.borrow().as_ref() {
+            cb(zoom);
         }
     }
+
+    /// Fired when the zoom changes, from the view itself (Ctrl+scroll) too.
+    pub fn connect_zoom_changed(&self, f: impl Fn(f64) + 'static) {
+        *self.inner.on_zoom.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Ctrl + scroll zooms, as in the PDF view.
+    fn connect_zoom(&self) {
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&self.inner);
+        scroll.connect_scroll(move |ctl, _dx, dy| {
+            let ctrl = ctl.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+            match weak.upgrade() {
+                Some(inner) if ctrl && dy != 0.0 => {
+                    let this = DocxView { inner };
+                    this.set_zoom(this.zoom() * if dy < 0.0 { 1.1 } else { 1.0 / 1.1 });
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        self.inner.widget.add_controller(scroll);
+    }
+}
+
+/// Whether a file is a picture, by its name.
+pub fn is_picture_file(path: &std::path::Path) -> bool {
+    let (kind, _) = gio::content_type_guess(Some(path), None);
+    kind.starts_with("image/")
+}
+
+/// The picture on the clipboard as a file: as it was copied if it is a kind
+/// Word shows, otherwise as PNG.
+async fn read_picture(clipboard: &gdk::Clipboard) -> Option<Vec<u8>> {
+    let offered: Vec<&str> = ["image/png", "image/jpeg", "image/gif", "image/bmp"]
+        .into_iter()
+        .filter(|m| clipboard.formats().contain_mime_type(m))
+        .collect();
+    if !offered.is_empty()
+        && let Ok((stream, _)) = clipboard.read_future(&offered, glib::Priority::DEFAULT).await
+    {
+        let mut data = Vec::new();
+        while let Ok(chunk) = stream.read_bytes_future(1 << 16, glib::Priority::DEFAULT).await {
+            if chunk.is_empty() {
+                break;
+            }
+            data.extend_from_slice(&chunk);
+        }
+        if gdk::Texture::from_bytes(&glib::Bytes::from(&data[..])).is_ok() {
+            return Some(data);
+        }
+    }
+    let texture = clipboard.read_texture_future().await.ok()??;
+    Some(texture.save_to_png_bytes().to_vec())
 }
 
 fn mark_name(item: usize) -> String {
@@ -606,6 +1042,9 @@ fn item_of_lock(tag: &str) -> Option<usize> {
 }
 
 const BLOCK_TAGS: [&str; 9] = ["title", "h1", "h2", "h3", "h4", "h5", "h6", "body", "quote"];
+/// How a paragraph read from the file is aligned. Shown, not edited: an
+/// edited paragraph keeps its alignment in the file, and a new one has none.
+const ALIGN_TAGS: [&str; 3] = ["align-center", "align-end", "align-justify"];
 const LIST_TAGS: [&str; 6] = ["list0", "list1", "list2", "list3", "list4", "list5"];
 
 fn block_tag(style: ParaStyle) -> String {
@@ -672,15 +1111,33 @@ fn read_line(buffer: &gtk::TextBuffer, start: gtk::TextIter, end: gtk::TextIter)
         }
         if !skip.iter().any(|t| at.has_tag(t)) {
             let flags = Inline::of(&at.tags());
-            let text: String = buffer.text(&at, &next, false).chars().filter(|&c| c != '\u{FFFC}').collect();
-            runs.push(Run {
+            let run = |text: String| Run {
                 text,
                 bold: flags.bold,
                 italic: flags.italic,
                 underline: flags.underline,
                 highlight: flags.highlight,
                 ..Default::default()
-            });
+            };
+            // The slice, unlike the text, keeps a character for each
+            // picture (and each table), where they are.
+            let mut text = String::new();
+            for (k, c) in buffer.slice(&at, &next, false).chars().enumerate() {
+                if c != '\u{FFFC}' {
+                    text.push(c);
+                    continue;
+                }
+                let picture = buffer.iter_at_offset(at.offset() + k as i32).paintable().and_downcast::<Picture>();
+                if let Some(picture) = picture {
+                    if !text.is_empty() {
+                        runs.push(run(std::mem::take(&mut text)));
+                    }
+                    runs.push(Run::picture(picture.image()));
+                }
+            }
+            if !text.is_empty() {
+                runs.push(run(text));
+            }
         }
         at = next;
     }
@@ -776,6 +1233,9 @@ fn make_tags(buffer: &gtk::TextBuffer) {
             t.set_indent(-16);
         });
     }
+    for (name, how) in ALIGN_TAGS.iter().zip([gtk::Justification::Center, gtk::Justification::Right, gtk::Justification::Fill]) {
+        tag(name, &|t| t.set_justification(how));
+    }
     tag(BULLET_TAG, &|t| t.set_editable(false));
     tag(LOCKED_TAG, &|t| t.set_editable(false));
     tag(PLACEHOLDER_TAG, &|t| {
@@ -784,12 +1244,16 @@ fn make_tags(buffer: &gtk::TextBuffer) {
     });
 }
 
-fn append_paragraph(buffer: &gtk::TextBuffer, style: ParaStyle, runs: &[Run]) {
+fn append_paragraph(buffer: &gtk::TextBuffer, style: ParaStyle, runs: &[Run], align: Align) {
     let start = buffer.create_mark(None, &buffer.end_iter(), true);
     if let ParaStyle::ListItem(level) = style {
         buffer.insert_with_tags_by_name(&mut buffer.end_iter(), bullet_text(level), &[BULLET_TAG]);
     }
     for run in runs {
+        if let Some(image) = &run.image {
+            buffer.insert_paintable(&mut buffer.end_iter(), &Picture::new(image.clone()));
+            continue;
+        }
         let mut names: Vec<&str> = Vec::new();
         if run.bold {
             names.push("bold");
@@ -812,6 +1276,15 @@ fn append_paragraph(buffer: &gtk::TextBuffer, style: ParaStyle, runs: &[Run]) {
     buffer.insert(&mut buffer.end_iter(), "\n");
     let (s, e) = (buffer.iter_at_mark(&start), buffer.end_iter());
     buffer.apply_tag_by_name(&block_tag(style), &s, &e);
+    let align = match align {
+        Align::Start => None,
+        Align::Center => Some(ALIGN_TAGS[0]),
+        Align::End => Some(ALIGN_TAGS[1]),
+        Align::Justify => Some(ALIGN_TAGS[2]),
+    };
+    if let Some(tag) = align {
+        buffer.apply_tag_by_name(tag, &s, &e);
+    }
     buffer.delete_mark(&start);
 }
 
@@ -848,6 +1321,85 @@ fn table(rows: &[Vec<String>]) -> gtk::Widget {
 mod tests {
     use super::*;
     use crate::docx::tests::package;
+
+    fn png() -> Vec<u8> {
+        let pixbuf = gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 4, 2).unwrap();
+        pixbuf.fill(0x3366ccff);
+        pixbuf.save_to_bufferv("png", &[]).unwrap()
+    }
+
+    fn whole(buffer: &gtk::TextBuffer) -> String {
+        buffer.slice(&buffer.start_iter(), &buffer.end_iter(), true).to_string()
+    }
+
+    fn pictures(buffer: &gtk::TextBuffer) -> usize {
+        let mut n = 0;
+        let mut at = buffer.start_iter();
+        loop {
+            n += at.paintable().is_some() as usize;
+            if !at.forward_char() {
+                return n;
+            }
+        }
+    }
+
+    #[test]
+    fn undo_takes_back_words_formatting_and_pictures() {
+        crate::gtk_test::run(undo_round_trip);
+    }
+
+    fn undo_round_trip() {
+        let doc = crate::docx::load(&package("<w:p><w:r><w:t>Hello</w:t></w:r></w:p>", &[])).unwrap();
+        let view = DocxView::new(doc);
+        view.set_editable(true);
+        let buffer = view.buffer().clone();
+        let original = whole(&buffer);
+        assert!(!view.can_undo(), "laying the document out is not an edit");
+
+        // Typing is undone a word at a time.
+        let mut at = buffer.iter_at_line(0).unwrap();
+        at.forward_to_line_end();
+        buffer.place_cursor(&at);
+        for c in " big world".chars() {
+            buffer.insert_interactive_at_cursor(&c.to_string(), true);
+        }
+        assert_eq!(whole(&buffer), "Hello big world\n");
+        view.undo();
+        assert_eq!(whole(&buffer), "Hello big\n");
+        view.undo();
+        assert_eq!(whole(&buffer), original);
+        view.redo();
+        view.redo();
+        assert_eq!(whole(&buffer), "Hello big world\n");
+
+        // Formatting is undone too.
+        let s = buffer.iter_at_offset(6);
+        let e = buffer.iter_at_offset(9);
+        buffer.select_range(&s, &e);
+        view.toggle("bold");
+        let bold = buffer.tag_table().lookup("bold").unwrap();
+        assert!(buffer.iter_at_offset(7).has_tag(&bold));
+        view.undo();
+        assert!(!buffer.iter_at_offset(7).has_tag(&bold), "undo takes the bold off");
+        view.redo();
+        assert!(buffer.iter_at_offset(7).has_tag(&bold), "redo puts it back");
+
+        // A picture comes and goes, and saves as one.
+        buffer.place_cursor(&buffer.iter_at_offset(5));
+        view.insert_picture(png()).unwrap();
+        assert_eq!(pictures(&buffer), 1);
+        view.undo();
+        assert_eq!((pictures(&buffer), whole(&buffer)), (0, "Hello big world\n".to_string()));
+        view.redo();
+        assert_eq!(pictures(&buffer), 1);
+        let saved = crate::docx::load(&view.save().unwrap()).unwrap();
+        let Some(Block::Paragraph { runs, .. }) = saved.blocks().into_iter().next() else { panic!() };
+        let picture = runs.iter().find_map(|r| r.image.clone()).expect("the picture is saved");
+        assert_eq!(picture.data.as_slice(), png().as_slice());
+        assert_eq!((picture.cx, picture.cy), (4 * 9525, 2 * 9525), "4×2 pixels at 96 dpi");
+        let text: String = runs.iter().filter(|r| r.image.is_none()).map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "Hello big world");
+    }
 
     #[test]
     fn edits_in_the_buffer_come_back_as_the_right_paragraphs() {
@@ -921,6 +1473,6 @@ mod tests {
         assert!(matches!(&out[2], Out::Para { style: ParaStyle::Heading(2), base: Some(1), .. }), "{:?}", out[2]);
         let saved = view.save().unwrap();
         let back = crate::docx::load(&saved).unwrap();
-        assert!(back.blocks().iter().any(|b| matches!(b, Block::Paragraph { style: ParaStyle::ListItem(0), runs } if runs.iter().any(|r| r.text == "Second item"))));
+        assert!(back.blocks().iter().any(|b| matches!(b, Block::Paragraph { style: ParaStyle::ListItem(0), runs, .. } if runs.iter().any(|r| r.text == "Second item"))));
     }
 }

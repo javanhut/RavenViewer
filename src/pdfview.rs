@@ -191,9 +191,13 @@ impl PdfView {
             })
             .collect();
 
+        // Scrollbars that stay: zoomed past the window's width the pages are
+        // scrolled sideways, and a scrollbar that only shows on hover is no
+        // help finding that out.
         let scroller = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
+            .overlay_scrolling(false)
             .css_classes(["canvas"])
             .child(&column)
             .build();
@@ -392,7 +396,11 @@ impl PdfView {
     }
 
     fn fit_width_zoom(&self) -> f64 {
-        let avail = self.inner.scroller.width() as f64 - 2.0 * MARGIN as f64 - 16.0;
+        // The viewport's width, past the vertical scrollbar; before the
+        // first layout, the widget's own less a scrollbar's worth.
+        let viewport = self.inner.scroller.hadjustment().page_size();
+        let width = if viewport > 0.0 { viewport - 2.0 } else { self.inner.scroller.width() as f64 - 16.0 };
+        let avail = width - 2.0 * MARGIN as f64;
         let widest = self.inner.info.borrow().page_sizes.iter().map(|s| s.0).fold(1.0, f32::max) as f64;
         if avail <= 0.0 { 1.0 } else { (avail / widest).clamp(MIN_ZOOM, MAX_ZOOM) }
     }

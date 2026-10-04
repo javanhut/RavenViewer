@@ -1,14 +1,19 @@
 [Desktop Entry]
 Name=Raven Viewer
-GenericName=Document Viewer
-Comment=Read PDF and DOCX files — outline, annotations, search
+GenericName=Document Viewer and Editor
+Comment=Read, write and convert PDF, Word and text files
 Exec=raven-viewer %U
 Icon=com.ravenviewer.Raven
 Terminal=false
 Type=Application
 Categories=Office;Viewer;GTK;
-Keywords=PDF;DOCX;Document;Reader;Viewer;Book;
-MimeType=application/pdf;application/x-pdf;application/vnd.openxmlformats-officedocument.wordprocessingml.document;
+Keywords=PDF;DOCX;DOC;Word;Text;Document;Reader;Viewer;Editor;Writer;Convert;Book;
+MimeType=application/pdf;application/x-pdf;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/msword;text/plain;
 StartupNotify=true
 StartupWMClass=raven-viewer
 DBusActivatable=false
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=raven-viewer --new-window

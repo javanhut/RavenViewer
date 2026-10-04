@@ -2,13 +2,18 @@
 //! invocation hands its files to the running instance instead of starting
 //! another process, so opening from the file manager is instant.
 
+mod cfb;
 mod config;
+mod convert;
+mod doc;
 mod docx;
 mod docxview;
+mod history;
 mod pagetiles;
 mod pdf;
 mod pdfedit;
 mod pdftext;
+mod render;
 mod pdfview;
 mod theme;
 mod window;
@@ -20,18 +25,27 @@ use libadwaita::prelude::*;
 use window::{APP_ID, MIME_TYPES, Window};
 
 const USAGE: &str = "\
-Raven Viewer — read, mark up, edit and combine PDF and DOCX files
+Raven Viewer — read, write, mark up, convert and combine PDFs, Word
+documents (.docx and .doc) and text files
 
 Usage:
-  raven-viewer [FILE…]                  open files (or an empty window)
+  raven-viewer [FILE…]                  open files as tabs in the running window
+                                        (or a new window, if there is none)
   raven-viewer open FILE…               same as above
-  raven-viewer combine OUT FILE FILE…   join PDFs (or DOCX files) into OUT
-  raven-viewer set-default              make Raven Viewer the default for PDF and DOCX
+  raven-viewer --new-window [FILE…]     a window of its own, in a process of its own
+  raven-viewer new FILE                 write an empty document (.docx, .doc, .txt)
+  raven-viewer convert IN OUT           convert IN to OUT's kind: .pdf, .docx, .doc or .txt
+  raven-viewer combine OUT FILE FILE…   join files into OUT: PDFs page by page,
+                                        documents one after another (a mix makes a PDF)
+  raven-viewer set-default              make Raven Viewer the default for PDF and Word
   raven-viewer --help | --version
 ";
 
 fn main() -> glib::ExitCode {
     let mut args: Vec<String> = std::env::args().collect();
+    // A separate instance: its own process, not handed to the running one.
+    let separate = args.iter().skip(1).any(|a| a == "--new-window" || a == "-n");
+    args.retain(|a| a != "--new-window" && a != "-n");
     match args.get(1).map(String::as_str) {
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
@@ -43,6 +57,8 @@ fn main() -> glib::ExitCode {
         }
         Some("set-default") => return set_default(),
         Some("combine") => return combine(&args[2..]),
+        Some("convert") => return convert_file(&args[2..]),
+        Some("new") => return new_file(&args[2..]),
         // `open` is sugar; GApplication takes the files as plain arguments.
         Some("open") => {
             args.remove(1);
@@ -50,21 +66,21 @@ fn main() -> glib::ExitCode {
         _ => {}
     }
 
-    let app = adw::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
+    let mut flags = gio::ApplicationFlags::HANDLES_OPEN;
+    if separate {
+        flags |= gio::ApplicationFlags::NON_UNIQUE;
+    }
+    let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
     app.connect_startup(|_| theme::apply());
-    app.connect_activate(|app| {
-        if let Some(win) = app.active_window() {
-            win.present();
-        } else {
-            Window::new(app).present();
-        }
-    });
+    // Launched again with nothing to open: another window.
+    app.connect_activate(|app| Window::new(app).present());
+    // Files open as tabs of the window last used, or of a new one.
     app.connect_open(|app, files, _hint| {
+        let win = app.active_window().and_then(|w| Window::of(&w)).unwrap_or_else(|| Window::new(app));
         for file in files {
-            let win = Window::new(app);
             win.open(file.clone());
-            win.present();
         }
+        win.present();
     });
     app.run_with_args(&args)
 }
@@ -85,6 +101,52 @@ fn set_default() -> glib::ExitCode {
     glib::ExitCode::SUCCESS
 }
 
+/// Run a command-line job, reporting how it went.
+fn run(job: impl FnOnce() -> anyhow::Result<String>) -> glib::ExitCode {
+    match job() {
+        Ok(done) => {
+            println!("{done}");
+            glib::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("raven-viewer: {e}");
+            glib::ExitCode::FAILURE
+        }
+    }
+}
+
+fn convert_file(args: &[String]) -> glib::ExitCode {
+    let [input, output] = args else {
+        eprint!("{USAGE}");
+        return glib::ExitCode::FAILURE;
+    };
+    run(|| {
+        let bytes = std::fs::read(input).map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
+        let out = std::path::Path::new(output);
+        let title = out.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned());
+        let converted = convert::convert(&bytes, convert::Format::of(out), &title)?;
+        std::fs::write(out, converted).map_err(|e| anyhow::anyhow!("{output}: {e}"))?;
+        Ok(format!("{input} → {output}"))
+    })
+}
+
+fn new_file(args: &[String]) -> glib::ExitCode {
+    let [output] = args else {
+        eprint!("{USAGE}");
+        return glib::ExitCode::FAILURE;
+    };
+    run(|| {
+        let out = std::path::Path::new(output);
+        if out.exists() {
+            anyhow::bail!("{output} already exists");
+        }
+        let blank = docx::blank(convert::local_paper(), &docx::TextDefaults::document());
+        let bytes = convert::convert(&blank, convert::Format::of(out), "")?;
+        std::fs::write(out, bytes).map_err(|e| anyhow::anyhow!("{output}: {e}"))?;
+        Ok(format!("wrote {output}"))
+    })
+}
+
 fn combine(args: &[String]) -> glib::ExitCode {
     let [out, inputs @ ..] = args else {
         eprint!("{USAGE}");
@@ -97,7 +159,7 @@ fn combine(args: &[String]) -> glib::ExitCode {
             let name = std::path::Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
             files.push((name, bytes));
         }
-        let merged = window::combine_files(&files)?;
+        let merged = convert::combine(&files)?;
         std::fs::write(out, merged).map_err(|e| anyhow::anyhow!("{out}: {e}"))?;
         Ok(())
     };

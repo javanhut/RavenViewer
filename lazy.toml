@@ -52,7 +52,7 @@ run = [
 ]
 
 [commands.set-default]
-desc = "Make Raven Viewer the default for PDF and DOCX (current user)"
+desc = "Make Raven Viewer the default for PDF and Word files (current user)"
 run = ["{{bindir}}/{{binary}} set-default"]
 
 [commands.uninstall]
