@@ -12,9 +12,10 @@ installed alongside: everything is done by Raven Viewer itself.
 | | |
 |---|---|
 | **PDF** | Continuous pages, rendered in pure Rust ([hayro](https://github.com/LaurenzV/hayro)) on background threads; only pages near the viewport are rasterized, so a 700-page book opens in ~0.2s |
+| **Page layout** | Menu → Page Layout: **Continuous** (one long column), **Single Page** or **Two Pages** side by side, turned left and right. Turn by clicking or tapping the left or right third of the view, `←` / `→` or `PgUp` / `PgDn`, the wheel or a touchpad swipe once the page can scroll no further, or a sideways swipe on a touchscreen. Pages fit the window (`Ctrl+0` re-fits). Pairs run 1–2, 3–4…, or with Page Layout → Cover on Its Own the first page stands alone and pairs run 2–3, 4–5…, as in a printed book |
 | **Jumping** | Fling the scrollbar or jump to a chapter and the page you land on is drawn first — work for pages you scrolled past is dropped, not queued |
 | **Go to page** | Click the page counter or `Ctrl+G`; `Ctrl+Home` / `Ctrl+End` for the ends |
-| **Contents** | The document outline in the sidebar; click a chapter to jump |
+| **Contents** | The document outline in the sidebar, open whenever a PDF has one; click a chapter to jump |
 | **Notes** | Annotations (comments, highlights, stamps…) listed with their page; click to jump to the spot |
 | **Search** | `Ctrl+F`, Enter for next, Shift+Enter for previous. Pages are searched lazily from where you are and stop at the first hit; tolerant of lost word spaces and ligatures |
 | **Zoom** | Fit width by default; `Ctrl` + scroll, pinch, `Ctrl++` / `Ctrl+−`, `Ctrl+0` to re-fit. Word and text documents zoom too (`Ctrl+0` back to actual size). Zoomed wider than the window, a page is scrolled sideways, with a scrollbar that stays visible (or Shift + scroll). Past the point where a whole page is a sensible thing to draw, PDF pages are tiled and only the tiles on screen are rasterized, so 800% costs a screenful rather than a page |
@@ -74,6 +75,7 @@ opening from the file manager or a browser download is instant.
 | Paste a picture | `Ctrl+V` (or drop a picture file) |
 | Zoom in / out / fit | `Ctrl++` / `Ctrl+−` / `Ctrl+0` |
 | Next / previous page | `N` / `P` (when not typing), `Ctrl+PgDn` / `Ctrl+PgUp` |
+| Turn the page (Single Page, Two Pages) | `←` / `→`, `PgUp` / `PgDn`, or click either side |
 | Go to page | `Ctrl+G` |
 | First / last page | `Ctrl+Home` / `Ctrl+End` |
 | Sidebar | `F9` |
@@ -107,6 +109,8 @@ show_sidebar = true
 dark_pages = false
 remember_position = true
 highlight_color = "yellow"   # yellow, green, blue or pink
+page_layout = "continuous"   # continuous, single or double
+cover_alone = false          # two pages: the first page on its own
 ```
 
 ## Tests

@@ -64,7 +64,8 @@ impl Desktop {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewerConfig {
-    /// Show the outline/annotations sidebar when a document opens.
+    /// Show the sidebar when a document opens. A PDF with a table of
+    /// contents shows it regardless, unless the window is narrow.
     pub show_sidebar: bool,
     /// Page background follows the theme (dark pages in dark mode).
     pub dark_pages: bool,
@@ -72,6 +73,13 @@ pub struct ViewerConfig {
     pub remember_position: bool,
     /// Colour for new highlights: yellow, green, blue or pink.
     pub highlight_color: String,
+    /// How PDF pages are laid out: continuous, single or double (see
+    /// `PageLayout`). A string, like the colour, so a value this version
+    /// does not know falls back on its own instead of failing the file.
+    pub page_layout: String,
+    /// In two-page layout, the first page (the cover) on its own, so pairs
+    /// run 2–3, 4–5… with even pages on the left, as in a printed book.
+    pub cover_alone: bool,
     pub positions: std::collections::BTreeMap<String, usize>,
 }
 
@@ -82,12 +90,18 @@ impl Default for ViewerConfig {
             dark_pages: false,
             remember_position: true,
             highlight_color: "yellow".into(),
+            page_layout: PageLayout::Continuous.id().into(),
+            cover_alone: false,
             positions: Default::default(),
         }
     }
 }
 
 impl ViewerConfig {
+    pub fn page_layout(&self) -> PageLayout {
+        PageLayout::from_id(&self.page_layout).unwrap_or_default()
+    }
+
     pub fn path() -> PathBuf {
         config_dir().join("viewer.toml")
     }
@@ -110,6 +124,47 @@ impl ViewerConfig {
         );
         std::fs::write(&path, text)?;
         Ok(())
+    }
+}
+
+/// How a PDF's pages are put in front of the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageLayout {
+    /// One long column, scrolled through.
+    #[default]
+    Continuous,
+    /// One page at a time, turned left and right.
+    Single,
+    /// Two pages side by side, turned a pair at a time.
+    Double,
+}
+
+impl PageLayout {
+    pub const ALL: [PageLayout; 3] = [PageLayout::Continuous, PageLayout::Single, PageLayout::Double];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            PageLayout::Continuous => "continuous",
+            PageLayout::Single => "single",
+            PageLayout::Double => "double",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<PageLayout> {
+        PageLayout::ALL.into_iter().find(|l| l.id() == id)
+    }
+
+    /// Pages turned at a time; 0 for the continuous column, which has no turns.
+    pub fn per_spread(self) -> usize {
+        match self {
+            PageLayout::Continuous => 0,
+            PageLayout::Single => 1,
+            PageLayout::Double => 2,
+        }
+    }
+
+    pub fn is_paged(self) -> bool {
+        self != PageLayout::Continuous
     }
 }
 

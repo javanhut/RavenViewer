@@ -2,6 +2,7 @@
 //! parsed document; lopdf reads what hayro does not expose (outline,
 //! annotations, text for search). Nothing here touches GTK.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -106,16 +107,155 @@ fn doc_title(doc: &lopdf::Document) -> Option<String> {
     (!placeholder).then(|| title.to_string())
 }
 
+/// The outline walked by hand rather than through lopdf's `get_toc`, which
+/// gives up on the whole outline over one entry it does not understand and
+/// knows nothing of PDF 1.1's named destinations (`/Dest /name` looked up in
+/// the catalog's `/Dests`) — the style KiCad's and many TeX manuals use.
 fn outline(doc: &lopdf::Document, pages: usize) -> Vec<OutlineEntry> {
-    let Ok(toc) = doc.get_toc() else { return Vec::new() };
-    toc.toc
-        .into_iter()
-        .map(|t| OutlineEntry {
-            level: t.level.saturating_sub(1),
-            title: t.title.trim().to_string(),
-            page: t.page.saturating_sub(1).min(pages - 1),
-        })
-        .collect()
+    let Ok(catalog) = doc.catalog() else { return Vec::new() };
+    let Ok(root) = catalog.get_deref(b"Outlines", doc).and_then(lopdf::Object::as_dict) else {
+        return Vec::new();
+    };
+    let dests = Dests::new(doc, catalog);
+    let mut out = Vec::new();
+    dests.walk(root.get(b"First").ok(), 0, &mut HashSet::new(), &mut out);
+    for e in &mut out {
+        e.page = e.page.min(pages - 1);
+    }
+    out
+}
+
+/// Deep enough for any real outline; a deeper one is a malformed file.
+const MAX_OUTLINE_DEPTH: usize = 32;
+
+/// What an outline entry can point at, resolved to page indices.
+struct Dests<'a> {
+    doc: &'a lopdf::Document,
+    pages: HashMap<lopdf::ObjectId, usize>,
+    /// Named destinations, from the catalog's `/Dests` dictionary (PDF 1.1)
+    /// and the `/Names` → `/Dests` name tree (PDF 1.2 on).
+    named: HashMap<&'a [u8], &'a lopdf::Object>,
+}
+
+impl<'a> Dests<'a> {
+    fn new(doc: &'a lopdf::Document, catalog: &'a lopdf::Dictionary) -> Self {
+        let pages = doc.get_pages().into_iter().map(|(n, id)| (id, n as usize - 1)).collect();
+        let mut named = HashMap::new();
+        if let Ok(dests) = catalog.get_deref(b"Dests", doc).and_then(lopdf::Object::as_dict) {
+            named.extend(dests.iter().map(|(k, v)| (k.as_slice(), v)));
+        }
+        if let Ok(tree) = catalog
+            .get_deref(b"Names", doc)
+            .and_then(lopdf::Object::as_dict)
+            .and_then(|n| n.get_deref(b"Dests", doc))
+            .and_then(lopdf::Object::as_dict)
+        {
+            name_tree(doc, tree, 0, &mut named);
+        }
+        Dests { doc, pages, named }
+    }
+
+    /// One level of the outline: `item` and its `/Next` siblings, each
+    /// followed by its children. `seen` stops a file whose links loop.
+    fn walk(
+        &self, mut item: Option<&'a lopdf::Object>, level: usize, seen: &mut HashSet<lopdf::ObjectId>,
+        out: &mut Vec<OutlineEntry>,
+    ) {
+        if level >= MAX_OUTLINE_DEPTH {
+            return;
+        }
+        while let Some(&lopdf::Object::Reference(id)) = item {
+            if !seen.insert(id) {
+                break;
+            }
+            let Ok(node) = self.doc.get_dictionary(id) else { break };
+            let title = node.get_deref(b"Title", self.doc).map(text).unwrap_or_default();
+            let at = out.len();
+            out.push(OutlineEntry { level, title, page: 0 });
+            self.walk(node.get(b"First").ok(), level + 1, seen, out);
+            // A heading that goes nowhere (or to a web page) still holds its
+            // chapter together: it opens where its first child does.
+            let page = self.item_page(node).or_else(|| out.get(at + 1).filter(|c| c.level > level).map(|c| c.page));
+            match page {
+                Some(page) => out[at].page = page,
+                None => {
+                    out.remove(at);
+                }
+            }
+            item = node.get(b"Next").ok();
+        }
+    }
+
+    fn item_page(&self, node: &lopdf::Dictionary) -> Option<usize> {
+        if let Ok(dest) = node.get(b"Dest") {
+            return self.page(dest, 0);
+        }
+        let action = node.get_deref(b"A", self.doc).and_then(lopdf::Object::as_dict).ok()?;
+        // GoToR and the like point into another file; only GoTo is a page here.
+        if action.get(b"S").and_then(lopdf::Object::as_name).ok()? != b"GoTo" {
+            return None;
+        }
+        self.page(action.get(b"D").ok()?, 0)
+    }
+
+    /// A destination is `[page /Fit …]`, a name or string naming one, a
+    /// dictionary holding one under `/D`, or a reference to any of these.
+    fn page(&self, dest: &lopdf::Object, depth: usize) -> Option<usize> {
+        use lopdf::Object;
+        if depth > 8 {
+            return None;
+        }
+        match dest {
+            Object::Array(a) => match a.first()? {
+                Object::Reference(id) => self.pages.get(id).copied(),
+                // Not allowed for a local GoTo, but some writers put the
+                // zero-based page number here.
+                Object::Integer(n) => usize::try_from(*n).ok(),
+                _ => None,
+            },
+            Object::Name(name) | Object::String(name, _) => self.page(self.named.get(name.as_slice())?, depth + 1),
+            Object::Dictionary(d) => self.page(d.get(b"D").ok()?, depth + 1),
+            Object::Reference(id) => self.page(self.doc.get_object(*id).ok()?, depth + 1),
+            _ => None,
+        }
+    }
+}
+
+/// Collects a name tree's `/Names` pairs, leaves first reached through `/Kids`.
+fn name_tree<'a>(
+    doc: &'a lopdf::Document, node: &'a lopdf::Dictionary, depth: usize,
+    out: &mut HashMap<&'a [u8], &'a lopdf::Object>,
+) {
+    if depth >= MAX_OUTLINE_DEPTH {
+        return;
+    }
+    if let Ok(kids) = node.get_deref(b"Kids", doc).and_then(lopdf::Object::as_array) {
+        for kid in kids {
+            if let Ok(kid) = kid.as_reference().and_then(|id| doc.get_dictionary(id)) {
+                name_tree(doc, kid, depth + 1, out);
+            }
+        }
+    }
+    if let Ok(names) = node.get_deref(b"Names", doc).and_then(lopdf::Object::as_array) {
+        for [key, value] in names.as_chunks::<2>().0 {
+            if let Ok(key) = key.as_str() {
+                out.insert(key, value);
+            }
+        }
+    }
+}
+
+/// A PDF text string as one line of plain text. Unlike
+/// `lopdf::decode_text_string`, a broken UTF-16 title still reads.
+fn text(obj: &lopdf::Object) -> String {
+    let Ok(bytes) = obj.as_str() else { return String::new() };
+    let s = match bytes.strip_prefix(b"\xFE\xFF") {
+        Some(be) => String::from_utf16_lossy(
+            &be.chunks(2).map(|c| u16::from_be_bytes([c[0], c.get(1).copied().unwrap_or(0)])).collect::<Vec<_>>(),
+        ),
+        None => lopdf::decode_text_string(obj).unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned()),
+    };
+    s.trim_start_matches('\u{feff}').split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn annotations(doc: &lopdf::Document) -> Vec<Annotation> {
@@ -726,6 +866,84 @@ mod tests {
         let a = &info.annotations[0];
         assert_eq!((a.page, a.kind.as_str(), a.contents.as_str()), (0, "Text", "Check this derivation"));
         assert!((a.y_fraction - 72.0 / 792.0).abs() < 1e-6);
+    }
+
+    /// Every way an outline entry can name its page: a direct `[page /Fit]`,
+    /// a PDF 1.1 name looked up in the catalog's `/Dests` (KiCad's manuals),
+    /// a string in the `/Names` tree, a GoTo action — and a heading with no
+    /// destination of its own, which opens at its first child. A `/Next`
+    /// that loops back must not hang the walk.
+    #[test]
+    fn reads_every_kind_of_outline_destination() {
+        use lopdf::{Document, Object, Stream, dictionary};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let content = doc.add_object(Stream::new(dictionary! {}, Vec::new()));
+        let pages: Vec<_> = (0..5)
+            .map(|_| doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id, "Contents" => content }))
+            .collect();
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Count" => 5,
+                "Kids" => pages.iter().map(|&p| p.into()).collect::<Vec<Object>>(),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            }),
+        );
+        let fit = |p: lopdf::ObjectId| Object::Array(vec![p.into(), Object::Name(b"Fit".to_vec())]);
+        let ids: Vec<_> = (0..6).map(|_| doc.new_object_id()).collect();
+        let outlines = doc.new_object_id();
+        let item = |title: &str, parent, next: Option<lopdf::ObjectId>| {
+            let mut d = dictionary! { "Title" => lopdf::text_string(title), "Parent" => parent };
+            if let Some(next) = next {
+                d.set("Next", next);
+            }
+            d
+        };
+        let mut direct = item("Direct", outlines, Some(ids[1]));
+        direct.set("Dest", fit(pages[0]));
+        let mut old_name = item("PDF 1.1 name", outlines, Some(ids[2]));
+        old_name.set("Dest", Object::Name(b"_intro".to_vec()));
+        // A heading with no destination: it takes its first child's page.
+        let mut heading = item("Heading", outlines, Some(ids[0]));
+        heading.set("First", ids[3]);
+        let mut tree_name = item("Name tree", ids[2], Some(ids[4]));
+        tree_name.set("Dest", Object::string_literal("sec.2"));
+        let mut action = item("GoTo action", ids[2], Some(ids[5]));
+        action.set("A", dictionary! { "S" => "GoTo", "D" => fit(pages[4]) });
+        let mut web = item("A web page", ids[2], None);
+        web.set("A", dictionary! { "S" => "URI", "URI" => Object::string_literal("https://example.com") });
+        // `Next` of the heading points back to the first item: a loop.
+        for (id, d) in ids.iter().zip([direct, old_name, heading, tree_name, action, web]) {
+            doc.objects.insert(*id, Object::Dictionary(d));
+        }
+        doc.objects.insert(
+            outlines,
+            Object::Dictionary(dictionary! { "Type" => "Outlines", "First" => ids[0], "Last" => ids[2] }),
+        );
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id, "Outlines" => outlines,
+            "Dests" => dictionary! { "_intro" => fit(pages[1]) },
+            "Names" => dictionary! { "Dests" => dictionary! {
+                "Names" => vec![Object::string_literal("sec.2"), dictionary! { "D" => fit(pages[3]) }.into()],
+            }},
+        });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let info = load_info(&Arc::new(bytes)).unwrap();
+        let got: Vec<_> = info.outline.iter().map(|e| (e.level, e.title.as_str(), e.page)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, "Direct", 0),
+                (0, "PDF 1.1 name", 1),
+                (0, "Heading", 3),
+                (1, "Name tree", 3),
+                (1, "GoTo action", 4),
+            ]
+        );
     }
 
     /// End to end through the render threads: a deeply zoomed page is cut

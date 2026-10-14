@@ -14,6 +14,12 @@
 //! Text can be selected like in any reader: drag across it, double-click a
 //! word, triple-click a line, Shift+click to extend. Where the characters are
 //! comes from `pdftext`, asked for page by page as pages come on screen.
+//!
+//! Besides the continuous column there are two paged layouts: one page, or
+//! two side by side, at a time. The same row of pages is used, laid on its
+//! side with every page but the ones being read hidden; pages turn with a
+//! click or tap on the left or right of the view, the arrow keys, the wheel
+//! or a sideways swipe.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -24,12 +30,29 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
+use crate::config::PageLayout;
 use crate::pagetiles::PageTiles;
 use crate::pdf::{DocumentInfo, Grid, RenderedTile, Renderer, TILE, TileKey};
 use crate::pdftext::{PageText, TextLayer};
 
 const PAGE_GAP: i32 = 18;
 const MARGIN: i32 = 24;
+/// Between the two pages of a pair: close, like a book's gutter.
+const SPREAD_GAP: i32 = 6;
+/// How much of the view, from each side, a click or tap turns the page.
+const TAP_EDGE: f64 = 1.0 / 3.0;
+/// A tap that moved further than this was a drag.
+const TAP_SLOP: f64 = 8.0;
+/// Touchpad scrolling, in pixels, that turns the page once the page has
+/// nowhere left to scroll.
+const TOUCHPAD_TURN: f64 = 60.0;
+/// After a turn, how long more scrolling is not taken as another one: a
+/// touchpad swipe turns one page however long it goes on (the next swipe
+/// is free to turn again), a wheel spun hard no more pages than can be seen.
+const TOUCHPAD_QUIET_US: i64 = 800_000;
+const WHEEL_QUIET_US: i64 = 150_000;
+/// Sideways finger speed, in pixels a second, that makes a swipe a turn.
+const SWIPE_SPEED: f64 = 400.0;
 /// Pages kept rasterized on each side of the viewport.
 const KEEP: usize = 4;
 /// Tiles are asked for this far outside the viewport as well, so panning a
@@ -49,8 +72,27 @@ const AUTOSCROLL_EDGE: f64 = 36.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Fit {
-    Width,
+    /// Follows the window: the column's width, or in a paged layout the
+    /// whole page or pair.
+    Window,
     Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Turn {
+    Previous,
+    Next,
+}
+
+/// A press that may turn out to be a tap on the side of a paged view.
+#[derive(Clone, Copy)]
+struct Tap {
+    x: f64,
+    y: f64,
+    /// A tap that clears a selection only clears it.
+    had_selection: bool,
+    /// A press on text may be the start of a double-click.
+    over_text: bool,
 }
 
 /// A point on a page, as fractions of the page as displayed.
@@ -111,6 +153,23 @@ struct Inner {
     offsets: RefCell<Vec<f64>>,
     zoom: Cell<f64>,
     fit: Cell<Fit>,
+    layout: Cell<PageLayout>,
+    /// Two pages to a pair after a cover on its own.
+    cover_alone: Cell<bool>,
+    /// In a paged layout, the pages on show: `start..end`.
+    shown: Cell<(usize, usize)>,
+    /// Scrolling past the edge of a paged view, not yet enough to turn.
+    wheel: Cell<f64>,
+    /// Monotonic time before which scrolling does not turn again.
+    quiet_until: Cell<i64>,
+    tap: Cell<Option<Tap>>,
+    /// A scroll waiting for GTK to measure the height it needs, and which
+    /// one it is; see `scroll_to`.
+    settle: RefCell<Option<(u64, glib::SignalHandlerId)>>,
+    settle_generation: Cell<u64>,
+    /// A tap on text turns the page only once it is clear it was not the
+    /// first half of a double-click.
+    pending_turn: RefCell<Option<glib::SourceId>>,
     /// Pages holding textures, and how many bytes each is holding.
     rendered: RefCell<HashMap<usize, usize>>,
     current: Cell<usize>,
@@ -183,6 +242,9 @@ impl PdfView {
                     // narrow page in a document that also holds a wide one
                     // would be stretched to the widest page's width.
                     .halign(gtk::Align::Center)
+                    // Side by side, a shorter page sits level with the
+                    // middle of its neighbour rather than being stretched.
+                    .valign(gtk::Align::Center)
                     .css_classes(["page"])
                     .paintable(painter)
                     .build();
@@ -214,7 +276,16 @@ impl PdfView {
             tiles,
             offsets: Default::default(),
             zoom: Cell::new(1.0),
-            fit: Cell::new(Fit::Width),
+            fit: Cell::new(Fit::Window),
+            layout: Cell::new(PageLayout::Continuous),
+            cover_alone: Cell::new(false),
+            shown: Cell::new((0, 0)),
+            wheel: Cell::new(0.0),
+            quiet_until: Cell::new(0),
+            tap: Cell::new(None),
+            settle: RefCell::new(None),
+            settle_generation: Cell::new(0),
+            pending_turn: RefCell::new(None),
             rendered: Default::default(),
             current: Cell::new(0),
             text: RefCell::new(Rc::new(TextLayer::spawn(bytes))),
@@ -330,61 +401,174 @@ impl PdfView {
         self.set_zoom(self.zoom() * factor);
     }
 
-    pub fn fit_width(&self) {
-        self.inner.fit.set(Fit::Width);
-        self.zoom_keeping_position(self.fit_width_zoom());
+    /// Zoom to the window: the column to its width, or in a paged layout
+    /// the whole page or pair into it.
+    pub fn fit(&self) {
+        self.inner.fit.set(Fit::Window);
+        self.zoom_keeping_position(self.fit_zoom());
     }
 
-    /// Scroll so `page` is at the top, `y_fraction` of the way down it.
+    pub fn layout(&self) -> PageLayout {
+        self.inner.layout.get()
+    }
+
+    /// Lay the pages out another way, staying on the page being read.
+    pub fn set_layout(&self, layout: PageLayout) {
+        if layout == self.layout() {
+            return;
+        }
+        let (page, y_fraction) = self.position();
+        self.inner.layout.set(layout);
+        let column = &self.inner.column;
+        if layout.is_paged() {
+            column.set_orientation(gtk::Orientation::Horizontal);
+            column.set_spacing(SPREAD_GAP);
+            column.set_valign(gtk::Align::Center);
+            let (start, end) = self.spread(page);
+            for (i, picture) in self.inner.pages.iter().enumerate() {
+                picture.set_visible((start..end).contains(&i));
+            }
+            self.inner.shown.set((start, end));
+        } else {
+            column.set_orientation(gtk::Orientation::Vertical);
+            column.set_spacing(PAGE_GAP);
+            column.set_valign(gtk::Align::Fill);
+            for picture in &self.inner.pages {
+                picture.set_visible(true);
+            }
+        }
+        if self.inner.fit.get() == Fit::Window {
+            let zoom = self.fit_zoom();
+            if (zoom - self.zoom()).abs() >= 1e-4 {
+                self.apply_zoom(zoom);
+            }
+        }
+        // The new arrangement is measured on the next layout pass.
+        let view = self.clone();
+        glib::idle_add_local_once(move || view.reveal(page, y_fraction, 0.0));
+    }
+
+    pub fn cover_alone(&self) -> bool {
+        self.inner.cover_alone.get()
+    }
+
+    /// Show the first page on its own in the two-page layout, pairing the
+    /// rest 2–3, 4–5…; or not, pairing 1–2, 3–4…
+    pub fn set_cover_alone(&self, alone: bool) {
+        if self.inner.cover_alone.replace(alone) == alone || self.layout() != PageLayout::Double {
+            return;
+        }
+        let (page, y_fraction) = self.position();
+        self.reveal(page, y_fraction, 0.0);
+    }
+
+    /// The pages shown with `page`, `start..end`.
+    fn spread(&self, page: usize) -> (usize, usize) {
+        spread_of(self.layout(), self.cover_alone(), page, self.page_count())
+    }
+
+    /// Show `page`, `y_fraction` of the way down it at the top of the view.
     pub fn go_to(&self, page: usize, y_fraction: f64) {
-        let page = page.min(self.page_count().saturating_sub(1));
-        let (top, height) = self.page_extent(page);
         // Land a little above an annotation so it is not against the edge.
         let lead = if y_fraction > 0.0 { 60.0 } else { 0.0 };
-        self.scroll_to(top + height * y_fraction - lead);
+        self.reveal(page, y_fraction, lead);
     }
 
-    /// Where the view is scrolled to, as a page and how far down it — to put
-    /// a rebuilt view back where this one was.
+    fn reveal(&self, page: usize, y_fraction: f64, lead: f64) {
+        let page = page.min(self.page_count().saturating_sub(1));
+        if !self.layout().is_paged() {
+            let (top, height) = self.page_extent(page);
+            self.scroll_to(top + height * y_fraction - lead);
+            return;
+        }
+        self.show_spread(page);
+        // Pages just shown are laid out on the next pass; place the view
+        // after it. Only a page zoomed past the window has anywhere to go.
+        let view = self.clone();
+        glib::idle_add_local_once(move || {
+            let (x, top, _, height) = view.page_rect(page);
+            if page != view.inner.shown.get().0 {
+                view.inner.scroller.hadjustment().set_value(x - MARGIN as f64);
+            }
+            view.scroll_to(top + height * y_fraction - lead);
+        });
+    }
+
+    /// Put the page (and its partner) on show and hide the ones before.
+    fn show_spread(&self, page: usize) {
+        let (start, end) = self.spread(page);
+        let (was_start, was_end) = self.inner.shown.replace((start, end));
+        for p in (was_start..was_end).filter(|p| !(start..end).contains(p)) {
+            self.inner.pages[p].set_visible(false);
+        }
+        for p in start..end {
+            self.inner.pages[p].set_visible(true);
+        }
+        if self.inner.fit.get() == Fit::Window {
+            let zoom = self.fit_zoom();
+            if (zoom - self.zoom()).abs() >= 1e-4 {
+                self.apply_zoom(zoom);
+            }
+        }
+        self.inner.scroller.hadjustment().set_value(0.0);
+        self.update_visible();
+    }
+
+    /// Where the view is, as a page and how far down it — to put a rebuilt
+    /// view back where this one was.
     pub fn position(&self) -> (usize, f64) {
         let y = self.inner.scroller.vadjustment().value();
-        let page = self.page_at(y);
+        let page = if self.layout().is_paged() { self.current_page() } else { self.page_at(y) };
         let (top, height) = self.page_extent(page);
         (page, if height > 0.0 { ((y - top) / height).max(0.0) } else { 0.0 })
     }
 
     /// Put the view at a position taken from `position`, at a zoom, exactly.
-    pub fn restore(&self, zoom: f64, fit_width: bool, page: usize, y_fraction: f64) {
-        if fit_width {
-            self.inner.fit.set(Fit::Width);
-            self.inner.zoom.set(self.fit_width_zoom());
+    pub fn restore(&self, zoom: f64, fit: bool, page: usize, y_fraction: f64) {
+        let zoom = if fit {
+            self.inner.fit.set(Fit::Window);
+            self.fit_zoom()
         } else {
             self.inner.fit.set(Fit::Manual);
-            self.inner.zoom.set(zoom.clamp(MIN_ZOOM, MAX_ZOOM));
-        }
-        if let Some(cb) = self.inner.on_zoom_changed.borrow().as_ref() {
-            cb(self.zoom());
-        }
-        self.inner.renderer.borrow().bump();
-        self.apply_sizes();
-        let page = page.min(self.page_count().saturating_sub(1));
+            zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+        };
+        self.apply_zoom(zoom);
         let view = self.clone();
-        glib::idle_add_local_once(move || {
-            let (top, height) = view.page_extent(page);
-            view.scroll_to(top + height * y_fraction);
-        });
+        glib::idle_add_local_once(move || view.reveal(page, y_fraction, 0.0));
     }
 
-    pub fn is_fit_width(&self) -> bool {
-        self.inner.fit.get() == Fit::Width
+    pub fn is_fit(&self) -> bool {
+        self.inner.fit.get() == Fit::Window
     }
 
+    /// The next page, or in a paged layout the next page or pair.
     pub fn next_page(&self) {
+        if self.layout().is_paged() {
+            let end = self.inner.shown.get().1;
+            if end < self.page_count() {
+                self.go_to(end, 0.0);
+            }
+            return;
+        }
         self.go_to(self.current_page() + 1, 0.0);
     }
 
     pub fn prev_page(&self) {
+        if self.layout().is_paged() {
+            let start = self.inner.shown.get().0;
+            if start > 0 {
+                self.go_to(start - 1, 0.0);
+            }
+            return;
+        }
         self.go_to(self.current_page().saturating_sub(1), 0.0);
+    }
+
+    fn turn(&self, turn: Turn) {
+        match turn {
+            Turn::Previous => self.prev_page(),
+            Turn::Next => self.next_page(),
+        }
     }
 
     pub fn first_page(&self) {
@@ -395,34 +579,97 @@ impl PdfView {
         self.go_to(self.page_count().saturating_sub(1), 0.0);
     }
 
-    fn fit_width_zoom(&self) -> f64 {
-        // The viewport's width, past the vertical scrollbar; before the
-        // first layout, the widget's own less a scrollbar's worth.
-        let viewport = self.inner.scroller.hadjustment().page_size();
-        let width = if viewport > 0.0 { viewport - 2.0 } else { self.inner.scroller.width() as f64 - 16.0 };
-        let avail = width - 2.0 * MARGIN as f64;
-        let widest = self.inner.info.borrow().page_sizes.iter().map(|s| s.0).fold(1.0, f32::max) as f64;
-        if avail <= 0.0 { 1.0 } else { (avail / widest).clamp(MIN_ZOOM, MAX_ZOOM) }
+    fn fit_zoom(&self) -> f64 {
+        // The viewport, past the scrollbars; before the first layout, the
+        // widget's own size less a scrollbar's worth.
+        let scroller = &self.inner.scroller;
+        let viewport = scroller.hadjustment().page_size();
+        let width = if viewport > 0.0 { viewport - 2.0 } else { scroller.width() as f64 - 16.0 };
+        let info = self.inner.info.borrow();
+        let widest = info.page_sizes.iter().map(|s| s.0).fold(1.0, f32::max) as f64;
+        let margins = 2.0 * MARGIN as f64;
+        let layout = self.layout();
+        if !layout.is_paged() {
+            let avail = width - margins;
+            return if avail <= 0.0 { 1.0 } else { (avail / widest).clamp(MIN_ZOOM, MAX_ZOOM) };
+        }
+        // The pages on show, so a book's one oversized cover does not
+        // shrink every other page. A last page without a partner is sized as
+        // if it had one like itself, the same as the pairs before it.
+        let viewport = scroller.vadjustment().page_size();
+        let height = if viewport > 0.0 { viewport - 2.0 } else { scroller.height() as f64 - 16.0 };
+        let (start, end) = self.inner.shown.get();
+        let shown = &info.page_sizes[start.min(end)..end];
+        let Some(&(last_width, _)) = shown.last() else { return 1.0 };
+        let across = layout.per_spread().min(info.page_sizes.len()).max(shown.len());
+        let pages_width = shown.iter().map(|s| s.0 as f64).sum::<f64>() + (across - shown.len()) as f64 * last_width as f64;
+        let tallest = shown.iter().map(|s| s.1).fold(1.0, f32::max) as f64;
+        let avail_width = width - margins - (across - 1) as f64 * SPREAD_GAP as f64;
+        let avail_height = height - margins;
+        if avail_width <= 0.0 || avail_height <= 0.0 {
+            return 1.0;
+        }
+        (avail_width / pages_width.max(1.0)).min(avail_height / tallest).clamp(MIN_ZOOM, MAX_ZOOM)
     }
 
-    /// Set the scroll position, re-applying it while GTK clamps it short.
-    /// A jump to page 600 right after opening, or straight after a zoom,
-    /// asks for a position past the column height GTK has measured so far;
-    /// without this the view quietly stops at the bottom of the old layout.
+    /// Set the scroll position, and if GTK clamps it short, set it again
+    /// when GTK has measured the new height. A jump to page 600 right after
+    /// opening, straight after a zoom or a change of layout, asks for a
+    /// position past the height measured so far; without this the view
+    /// quietly stops at the bottom of the old layout. The target is held to
+    /// what the model says can be reached, so a page that cannot come to the
+    /// top (the last one) is not waited for.
     fn scroll_to(&self, y: f64) {
-        self.scroll_to_within(y, 4);
-    }
-
-    fn scroll_to_within(&self, y: f64, tries: u8) {
         let adj = self.inner.scroller.vadjustment();
-        let y = y.max(0.0);
+        if let Some((_, id)) = self.inner.settle.borrow_mut().take() {
+            adj.disconnect(id);
+        }
+        let y = y.min(self.content_height() - adj.page_size()).max(0.0);
         adj.set_value(y);
-        if tries == 0 || (adj.value() - y).abs() < 0.5 {
-            self.update_visible();
+        self.update_visible();
+        if (adj.value() - y).abs() < 1.5 {
             return;
         }
-        let view = self.clone();
-        glib::idle_add_local_once(move || view.scroll_to_within(y, tries - 1));
+        let generation = self.inner.settle_generation.get() + 1;
+        self.inner.settle_generation.set(generation);
+        let weak = Rc::downgrade(&self.inner);
+        let id = adj.connect_changed(move |adj| {
+            let Some(inner) = weak.upgrade() else { return };
+            adj.set_value(y);
+            if (adj.value() - y).abs() < 1.5 {
+                if let Some((_, id)) = inner.settle.borrow_mut().take() {
+                    adj.disconnect(id);
+                }
+                PdfView { inner }.update_visible();
+            }
+        });
+        *self.inner.settle.borrow_mut() = Some((generation, id));
+        // A layout that never gets there stops being waited for.
+        let weak = Rc::downgrade(&self.inner);
+        glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+            let Some(inner) = weak.upgrade() else { return };
+            let mut settle = inner.settle.borrow_mut();
+            if settle.as_ref().is_some_and(|(g, _)| *g == generation)
+                && let Some((_, id)) = settle.take()
+            {
+                inner.scroller.vadjustment().disconnect(id);
+            }
+        });
+    }
+
+    /// The scrolled content's height once laid out, from the model.
+    fn content_height(&self) -> f64 {
+        let viewport = self.inner.scroller.vadjustment().page_size();
+        let margins = 2.0 * MARGIN as f64;
+        let height = if self.layout().is_paged() {
+            let (start, end) = self.inner.shown.get();
+            (start..end).map(|p| self.page_extent(p).1).fold(0.0, f64::max) + margins
+        } else {
+            // The running total holds a gap after the last page, where the
+            // column has its bottom margin.
+            self.inner.offsets.borrow().last().copied().unwrap_or(0.0) - PAGE_GAP as f64 + MARGIN as f64
+        };
+        height.max(viewport)
     }
 
     fn zoom_keeping_position(&self, zoom: f64) {
@@ -438,10 +685,21 @@ impl PdfView {
         // zooming then grows the page around what is being read.
         let adj = self.inner.scroller.vadjustment();
         let anchor = adj.value() + adj.page_size() * 0.5;
-        let page = self.page_at(anchor);
+        let page = if self.layout().is_paged() { self.current_page() } else { self.page_at(anchor) };
         let (top, height) = self.page_extent(page);
         let frac = if height > 0.0 { (anchor - top) / height } else { 0.0 };
 
+        self.apply_zoom(zoom);
+        // Sizes land on the next layout pass; restore the position after it.
+        let view = self.clone();
+        glib::idle_add_local_once(move || {
+            let (top, height) = view.page_extent(page);
+            let half = view.inner.scroller.vadjustment().page_size() * 0.5;
+            view.scroll_to(top + height * frac - half);
+        });
+    }
+
+    fn apply_zoom(&self, zoom: f64) {
         self.inner.zoom.set(zoom);
         if let Some(cb) = self.inner.on_zoom_changed.borrow().as_ref() {
             cb(zoom);
@@ -450,13 +708,6 @@ impl PdfView {
         // until the sharp ones land, but none of them counts as done.
         self.inner.renderer.borrow().bump();
         self.apply_sizes();
-        // Sizes land on the next layout pass; restore the position after it.
-        let view = self.clone();
-        glib::idle_add_local_once(move || {
-            let (top, height) = view.page_extent(page);
-            let half = view.inner.scroller.vadjustment().page_size() * 0.5;
-            view.scroll_to(top + height * frac - half);
-        });
     }
 
     fn apply_sizes(&self) {
@@ -471,9 +722,32 @@ impl PdfView {
     /// (top offset, height) of a page in scroller coordinates, from the model
     /// rather than widget allocation so it is right before layout happens.
     fn page_extent(&self, page: usize) -> (f64, f64) {
-        let offsets = self.inner.offsets.borrow();
-        let top = offsets[page];
-        (top, offsets[page + 1] - top - PAGE_GAP as f64)
+        let (_, top, _, height) = self.page_rect(page);
+        (top, height)
+    }
+
+    /// (left, top, width, height) of a page in the scrolled content. Pages
+    /// are centred across the content, and in a paged layout down it too.
+    fn page_rect(&self, page: usize) -> (f64, f64, f64, f64) {
+        let zoom = self.zoom();
+        let info = self.inner.info.borrow();
+        let size = |p: usize| {
+            let (w, h) = info.page_sizes[p];
+            ((w as f64 * zoom).round(), (h as f64 * zoom).round())
+        };
+        let (hadj, vadj) = (self.inner.scroller.hadjustment(), self.inner.scroller.vadjustment());
+        if !self.layout().is_paged() {
+            let width = size(page).0;
+            let offsets = self.inner.offsets.borrow();
+            let top = offsets[page];
+            let left = (hadj.upper().max(width) - width) / 2.0;
+            return (left, top, width, offsets[page + 1] - top - PAGE_GAP as f64);
+        }
+        let (start, end) = spread_of(self.layout(), self.cover_alone(), page, info.page_sizes.len());
+        let sizes: Vec<(f64, f64)> = (start..end).map(size).collect();
+        let (left, top) = place_spread(&sizes, (hadj.page_size(), vadj.page_size()))[page - start];
+        let (width, height) = sizes[page - start];
+        (left, top, width, height)
     }
 
     fn page_at(&self, y: f64) -> usize {
@@ -488,14 +762,23 @@ impl PdfView {
             }
         });
 
-        // Width changes re-fit while in fit-width mode. `notify::width`
-        // is not emitted for allocations, so watch the page-size adjustment.
-        // That fires *during* size allocation, and resizing the pages there
+        // Panning a zoomed page sideways brings other tiles on screen.
+        let weak = Rc::downgrade(&self.inner);
+        self.inner.scroller.hadjustment().connect_value_changed(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                PdfView { inner }.update_visible();
+            }
+        });
+
+        // Size changes re-fit while fitting the window: its width for the
+        // column, width and height for a page or pair. `notify::width` is
+        // not emitted for allocations, so watch the page-size adjustments.
+        // They fire *during* size allocation, and resizing the pages there
         // makes GTK measure a stale layout; so the re-fit waits for idle,
         // coalescing a window drag's many notifications into one.
         let weak = Rc::downgrade(&self.inner);
         let pending = Rc::new(Cell::new(false));
-        self.inner.scroller.hadjustment().connect_page_size_notify(move |_| {
+        let refit = Rc::new(move || {
             if pending.replace(true) {
                 return;
             }
@@ -504,13 +787,16 @@ impl PdfView {
                 pending.set(false);
                 if let Some(inner) = weak.upgrade() {
                     let view = PdfView { inner };
-                    if view.inner.fit.get() == Fit::Width {
-                        view.zoom_keeping_position(view.fit_width_zoom());
+                    if view.inner.fit.get() == Fit::Window {
+                        view.zoom_keeping_position(view.fit_zoom());
                     }
                     view.update_visible();
                 }
             });
         });
+        let width_refit = refit.clone();
+        self.inner.scroller.hadjustment().connect_page_size_notify(move |_| width_refit());
+        self.inner.scroller.vadjustment().connect_page_size_notify(move |_| refit());
 
         // Ctrl + scroll zooms, like every other reader.
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
@@ -543,6 +829,148 @@ impl PdfView {
             }
         });
         self.inner.scroller.add_controller(pinch);
+
+        self.connect_paging();
+    }
+
+    /// How a paged view turns: the wheel or touchpad past the page's edge, a
+    /// click or tap on either side, a sideways swipe.
+    fn connect_paging(&self) {
+        let scroller = &self.inner.scroller;
+
+        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        let weak = Rc::downgrade(&self.inner);
+        wheel.connect_scroll_begin(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.wheel.set(0.0);
+            }
+        });
+        // Fingers off the touchpad: the next swipe is a fresh turn.
+        let weak = Rc::downgrade(&self.inner);
+        wheel.connect_scroll_end(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.wheel.set(0.0);
+                inner.quiet_until.set(0);
+            }
+        });
+        let weak = Rc::downgrade(&self.inner);
+        wheel.connect_scroll(move |ctl, dx, dy| {
+            let Some(inner) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let view = PdfView { inner };
+            let ctrl = ctl.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+            if !view.layout().is_paged() || ctrl {
+                return glib::Propagation::Proceed;
+            }
+            let scroller = &view.inner.scroller;
+            let (adj, delta) =
+                if dy.abs() >= dx.abs() { (scroller.vadjustment(), dy) } else { (scroller.hadjustment(), dx) };
+            // A page zoomed past the window scrolls first; only at its
+            // edge does scrolling on turn the page.
+            let at_edge = if delta > 0.0 {
+                adj.value() + adj.page_size() >= adj.upper() - 1.0
+            } else {
+                adj.value() <= 1.0
+            };
+            if delta == 0.0 || !at_edge {
+                view.inner.wheel.set(0.0);
+                return glib::Propagation::Proceed;
+            }
+            view.wheel_turn(delta, ctl.unit() == gdk::ScrollUnit::Surface);
+            glib::Propagation::Stop
+        });
+        scroller.add_controller(wheel);
+
+        // Taps are watched on the way in, before the page's own selection
+        // gesture has cleared a selection, so a tap that only dismisses one
+        // does not also turn the page.
+        let tap = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_PRIMARY)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let weak = Rc::downgrade(&self.inner);
+        tap.connect_pressed(move |_, presses, x, y| {
+            let Some(inner) = weak.upgrade() else { return };
+            if let Some(id) = inner.pending_turn.borrow_mut().take() {
+                id.remove();
+            }
+            let view = PdfView { inner };
+            let tap = (presses == 1 && view.layout().is_paged())
+                .then(|| Tap { x, y, had_selection: view.has_selection(), over_text: view.over_text(x, y) });
+            view.inner.tap.set(tap);
+        });
+        let weak = Rc::downgrade(&self.inner);
+        tap.connect_released(move |gesture, presses, x, y| {
+            let Some(inner) = weak.upgrade() else { return };
+            let Some(tap) = inner.tap.take() else { return };
+            let view = PdfView { inner };
+            let moved = (x - tap.x).abs() > TAP_SLOP || (y - tap.y).abs() > TAP_SLOP;
+            let shift = gesture.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
+            if presses != 1 || moved || shift || tap.had_selection || view.has_selection() {
+                return;
+            }
+            let scroller = &view.inner.scroller;
+            // Past the viewport is a scrollbar.
+            if y > scroller.vadjustment().page_size() {
+                return;
+            }
+            let Some(turn) = tap_turn(x, scroller.hadjustment().page_size()) else { return };
+            let touch = gesture.device().is_some_and(|d| d.source() == gdk::InputSource::Touchscreen);
+            if touch || !tap.over_text {
+                view.turn(turn);
+                return;
+            }
+            let wait = gtk::Settings::default().map_or(400, |s| s.gtk_double_click_time()).max(0) as u64;
+            let weak = Rc::downgrade(&view.inner);
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(wait), move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.pending_turn.borrow_mut().take();
+                    PdfView { inner }.turn(turn);
+                }
+            });
+            *view.inner.pending_turn.borrow_mut() = Some(id);
+        });
+        scroller.add_controller(tap);
+
+        // A finger flicked sideways turns the page, once a zoomed page has
+        // been panned to its edge.
+        let swipe = gtk::GestureSwipe::builder()
+            .touch_only(true)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let weak = Rc::downgrade(&self.inner);
+        swipe.connect_swipe(move |_, vx, vy| {
+            let Some(inner) = weak.upgrade() else { return };
+            let view = PdfView { inner };
+            if !view.layout().is_paged() || vx.abs() < SWIPE_SPEED || vx.abs() < 2.0 * vy.abs() {
+                return;
+            }
+            let adj = view.inner.scroller.hadjustment();
+            // The finger moving left brings in the page to the right.
+            let turn = if vx < 0.0 { Turn::Next } else { Turn::Previous };
+            let at_edge = match turn {
+                Turn::Next => adj.value() + adj.page_size() >= adj.upper() - 1.0,
+                Turn::Previous => adj.value() <= 1.0,
+            };
+            if at_edge {
+                view.turn(turn);
+            }
+        });
+        scroller.add_controller(swipe);
+    }
+
+    fn wheel_turn(&self, delta: f64, touchpad: bool) {
+        let now = glib::monotonic_time();
+        if now < self.inner.quiet_until.get() {
+            return;
+        }
+        let total = self.inner.wheel.get() + delta;
+        if total.abs() < if touchpad { TOUCHPAD_TURN } else { 1.0 } {
+            self.inner.wheel.set(total);
+            return;
+        }
+        self.inner.wheel.set(0.0);
+        self.inner.quiet_until.set(now + if touchpad { TOUCHPAD_QUIET_US } else { WHEEL_QUIET_US });
+        self.turn(if total > 0.0 { Turn::Next } else { Turn::Previous });
     }
 
     fn update_visible(&self) {
@@ -550,11 +978,14 @@ impl PdfView {
         if n == 0 {
             return;
         }
-        let adj = self.inner.scroller.vadjustment();
-        let height = adj.page_size().max(1.0);
-        let first = self.page_at(adj.value());
-        let last = self.page_at(adj.value() + height);
-        let current = self.page_at(adj.value() + height * 0.35);
+        let (first, last, current) = if self.layout().is_paged() {
+            let (start, end) = self.inner.shown.get();
+            (start, end.max(start + 1) - 1, start)
+        } else {
+            let adj = self.inner.scroller.vadjustment();
+            let height = adj.page_size().max(1.0);
+            (self.page_at(adj.value()), self.page_at(adj.value() + height), self.page_at(adj.value() + height * 0.35))
+        };
 
         if current != self.inner.current.replace(current)
             && let Some(cb) = self.inner.on_page_changed.borrow().as_ref()
@@ -648,14 +1079,12 @@ impl PdfView {
         }
 
         // The slice of this page the viewport covers, as fractions of it.
-        // Horizontally the page is centred in the scrolled content, which is
-        // exact from the adjustment alone — no waiting for an allocation.
-        let zoom = self.zoom();
-        let (top, page_height) = self.page_extent(page);
-        let page_width = (size.0 as f64 * zoom).round().max(1.0);
+        // Where the page is comes from the model, exact from the
+        // adjustments alone — no waiting for an allocation.
+        let (left, top, page_width, page_height) = self.page_rect(page);
+        let page_width = page_width.max(1.0);
         let vadj = self.inner.scroller.vadjustment();
         let hadj = self.inner.scroller.hadjustment();
-        let left = (hadj.upper().max(page_width) - page_width) / 2.0;
 
         let margin = TILE_MARGIN / factor;
         let across = |value: f64, span: f64, origin: f64, extent: f64| {
@@ -766,15 +1195,33 @@ impl PdfView {
         self.spot_at(at.x() as f64, at.y() as f64)
     }
 
-    /// The same for a point in the scroller's coordinates.
+    /// The same for a point in the scroller's coordinates. Side by side, a
+    /// point beside or between the pages belongs to the nearer one.
     pub fn spot_at(&self, x: f64, y: f64) -> Option<Spot> {
         let scroller = &self.inner.scroller;
-        let content_y = y + scroller.vadjustment().value();
-        let page = self.page_at(content_y);
-        let picture = self.inner.pages.get(page)?;
-        let local = scroller.compute_point(picture, &gtk::graphene::Point::new(x as f32, y as f32))?;
-        let (w, h) = (picture.width().max(1) as f32, picture.height().max(1) as f32);
-        Some(Spot { page, x: (local.x() / w).clamp(0.0, 1.0), y: (local.y() / h).clamp(0.0, 1.0) })
+        let (from, to) = if self.layout().is_paged() {
+            self.inner.shown.get()
+        } else {
+            let page = self.page_at(y + scroller.vadjustment().value());
+            (page, page + 1)
+        };
+        let point = gtk::graphene::Point::new(x as f32, y as f32);
+        (from..to)
+            .filter_map(|page| {
+                let picture = self.inner.pages.get(page)?;
+                let local = scroller.compute_point(picture, &point)?;
+                let (w, h) = (picture.width().max(1) as f32, picture.height().max(1) as f32);
+                let beside = (local.x() - local.x().clamp(0.0, w)).abs();
+                Some((beside, Spot { page, x: (local.x() / w).clamp(0.0, 1.0), y: (local.y() / h).clamp(0.0, 1.0) }))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, spot)| spot)
+    }
+
+    /// Whether a point in the scroller's coordinates is over a page's text.
+    fn over_text(&self, x: f64, y: f64) -> bool {
+        self.spot_at(x, y)
+            .is_some_and(|s| self.inner.texts.borrow().get(&s.page).is_some_and(|t| t.is_over_text(s.x, s.y)))
     }
 
     fn caret_at(&self, spot: Spot) -> Option<Caret> {
@@ -1112,6 +1559,55 @@ fn page_offsets(sizes: &[(f32, f32)], zoom: f64) -> Vec<f64> {
     offsets
 }
 
+/// The pages shown together with `page` in a paged layout, `start..end`:
+/// pairs start on the first page, so 1–2, 3–4 and so on — or, with the
+/// cover on its own, on the second: 1, 2–3, 4–5.
+fn spread_of(layout: PageLayout, cover_alone: bool, page: usize, pages: usize) -> (usize, usize) {
+    let per = layout.per_spread().max(1);
+    let page = page.min(pages.saturating_sub(1));
+    let first = usize::from(cover_alone && per > 1);
+    if page < first {
+        return (0, 1.min(pages));
+    }
+    let start = first + (page - first) / per * per;
+    (start, (start + per).min(pages))
+}
+
+/// Where the pages of a spread go, given their sizes and the viewport: side
+/// by side, the row centred in the view (or at the margin once it is wider
+/// or taller), each page centred on the row's height.
+fn place_spread(sizes: &[(f64, f64)], viewport: (f64, f64)) -> Vec<(f64, f64)> {
+    let gap = SPREAD_GAP as f64;
+    let width = sizes.iter().map(|s| s.0).sum::<f64>() + gap * sizes.len().saturating_sub(1) as f64;
+    let height = sizes.iter().map(|s| s.1).fold(0.0, f64::max);
+    let margins = 2.0 * MARGIN as f64;
+    let left = (viewport.0.max(width + margins) - width) / 2.0;
+    let top = (viewport.1.max(height + margins) - height) / 2.0;
+    let mut x = left;
+    sizes
+        .iter()
+        .map(|&(w, h)| {
+            let at = (x, top + (height - h) / 2.0);
+            x += w + gap;
+            at
+        })
+        .collect()
+}
+
+/// The turn a click at `x` across a view `width` wide asks for: the left
+/// third goes back, the right third on, the middle is left for reading.
+fn tap_turn(x: f64, width: f64) -> Option<Turn> {
+    if width <= 0.0 || !(0.0..=width).contains(&x) {
+        None
+    } else if x < width * TAP_EDGE {
+        Some(Turn::Previous)
+    } else if x > width * (1.0 - TAP_EDGE) {
+        Some(Turn::Next)
+    } else {
+        None
+    }
+}
+
 /// The page covering `y`, or the one just above it when `y` falls in a gap.
 fn page_at(offsets: &[f64], y: f64) -> usize {
     let pages = offsets.len().saturating_sub(1);
@@ -1160,6 +1656,58 @@ mod tests {
                 assert_eq!(page_at(&offsets, top + height * 0.5), page);
             }
         }
+    }
+
+    #[test]
+    fn pairs_start_on_the_first_page_and_an_odd_last_page_stands_alone() {
+        let double = PageLayout::Double;
+        assert_eq!(spread_of(double, false, 0, 5), (0, 2));
+        assert_eq!(spread_of(double, false, 1, 5), (0, 2), "page 2 is shown with page 1");
+        assert_eq!(spread_of(double, false, 3, 5), (2, 4));
+        assert_eq!(spread_of(double, false, 4, 5), (4, 5), "the odd last page on its own");
+        assert_eq!(spread_of(double, false, 99, 5), (4, 5), "past the end clamps");
+        assert_eq!(spread_of(PageLayout::Single, false, 3, 5), (3, 4));
+        assert_eq!(spread_of(double, false, 0, 1), (0, 1), "a one-page document");
+    }
+
+    #[test]
+    fn with_the_cover_alone_pairs_start_on_the_second_page() {
+        let double = PageLayout::Double;
+        assert_eq!(spread_of(double, true, 0, 6), (0, 1), "the cover on its own");
+        assert_eq!(spread_of(double, true, 1, 6), (1, 3));
+        assert_eq!(spread_of(double, true, 2, 6), (1, 3), "page 3 is shown with page 2");
+        assert_eq!(spread_of(double, true, 4, 6), (3, 5));
+        assert_eq!(spread_of(double, true, 5, 6), (5, 6), "an even page count ends on a lone page");
+        assert_eq!(spread_of(double, true, 4, 5), (3, 5), "an odd one ends on a pair");
+        assert_eq!(spread_of(double, true, 0, 1), (0, 1), "a one-page document");
+        // Single pages do not pair, so there is no cover to set apart.
+        assert_eq!(spread_of(PageLayout::Single, true, 0, 6), (0, 1));
+        assert_eq!(spread_of(PageLayout::Single, true, 3, 6), (3, 4));
+    }
+
+    #[test]
+    fn a_spread_is_centred_with_its_pages_side_by_side() {
+        let gap = SPREAD_GAP as f64;
+        // Two pages in a roomy window: centred both ways, the gap between.
+        let at = place_spread(&[(400.0, 500.0), (400.0, 500.0)], (1200.0, 900.0));
+        let width = 800.0 + gap;
+        assert_eq!(at[0], ((1200.0 - width) / 2.0, 200.0));
+        assert_eq!(at[1], (at[0].0 + 400.0 + gap, 200.0));
+        // A shorter page sits level with the middle of its neighbour.
+        let at = place_spread(&[(400.0, 500.0), (400.0, 300.0)], (1200.0, 900.0));
+        assert_eq!(at[1].1, 200.0 + 100.0);
+        // Bigger than the window: the margin, and the rest scrolls.
+        let at = place_spread(&[(2000.0, 3000.0)], (800.0, 600.0));
+        assert_eq!(at[0], (MARGIN as f64, MARGIN as f64));
+    }
+
+    #[test]
+    fn the_sides_of_the_view_turn_and_its_middle_does_not() {
+        assert_eq!(tap_turn(10.0, 900.0), Some(Turn::Previous));
+        assert_eq!(tap_turn(450.0, 900.0), None);
+        assert_eq!(tap_turn(890.0, 900.0), Some(Turn::Next));
+        assert_eq!(tap_turn(905.0, 900.0), None, "the scrollbar");
+        assert_eq!(tap_turn(10.0, 0.0), None, "before the first layout");
     }
 
     #[test]

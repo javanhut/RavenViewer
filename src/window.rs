@@ -19,7 +19,7 @@ use gtk4 as gtk;
 use gtk4::{gdk, gio, glib};
 use libadwaita as adw;
 
-use crate::config::ViewerConfig;
+use crate::config::{PageLayout, ViewerConfig};
 use crate::convert::{self, Format};
 use crate::docx::{ParaStyle, TextDefaults};
 use crate::docxview::{self, DocxView, Inline};
@@ -103,6 +103,10 @@ const STYLES: [(&str, ParaStyle); 7] = [
     ("Bulleted List", ParaStyle::ListItem(0)),
 ];
 
+/// Menu → Page Layout.
+const PAGE_LAYOUTS: [(PageLayout, &str); 3] =
+    [(PageLayout::Continuous, "Continuous"), (PageLayout::Single, "Single Page"), (PageLayout::Double, "Two Pages")];
+
 const HIGHLIGHT_COLORS: [(&str, &str, [f32; 3]); 4] = [
     ("yellow", "Yellow", [1.0, 0.86, 0.1]),
     ("green", "Green", [0.45, 0.9, 0.35]),
@@ -117,6 +121,8 @@ struct Tab {
     /// What the tab view holds.
     root: gtk::Box,
     split: adw::OverlaySplitView,
+    /// The sidebar's Contents · Notes pages.
+    side_stack: adw::ViewStack,
     content: gtk::Stack,
     /// Where popovers over the document are anchored; it outlives any one
     /// document's view.
@@ -248,6 +254,14 @@ impl Window {
         }
         menu.append_submenu(Some("Highlight Color"), &colors);
         let view_section = gio::Menu::new();
+        let layouts = gio::Menu::new();
+        for (layout, label) in PAGE_LAYOUTS {
+            layouts.append(Some(label), Some(&format!("win.page-layout::{}", layout.id())));
+        }
+        let cover = gio::Menu::new();
+        cover.append(Some("Cover on Its Own"), Some("win.cover-alone"));
+        layouts.append_section(None, &cover);
+        view_section.append_submenu(Some("Page Layout"), &layouts);
         view_section.append(Some("Split View"), Some("win.split"));
         view_section.append(Some("Dark Pages"), Some("win.dark-pages"));
         view_section.append(Some("Fit Width"), Some("win.fit"));
@@ -676,8 +690,17 @@ impl Window {
             let cfg = self.0.config.borrow();
             cfg.remember_position.then(|| cfg.positions.get(path.to_string_lossy().as_ref()).copied()).flatten()
         };
-        let has_sidebar = !info.outline.is_empty() || !info.annotations.is_empty();
-        self.1.split.set_show_sidebar(has_sidebar && self.0.config.borrow().show_sidebar);
+        // A table of contents is what the sidebar is for, so a document with
+        // one opens with it beside the page even after F9 hid it for one
+        // without; only a window too narrow for both keeps it tucked away.
+        let has_outline = !info.outline.is_empty();
+        let has_notes = !info.annotations.is_empty();
+        if has_outline {
+            self.1.side_stack.set_visible_child_name("contents");
+        }
+        let show = (has_outline && !self.1.split.is_collapsed())
+            || ((has_outline || has_notes) && self.0.config.borrow().show_sidebar);
+        self.1.split.set_show_sidebar(show);
 
         let search = Rc::new(pdf::Searcher::spawn(bytes.clone(), view.page_count()));
         let edits = Rc::new(PdfEdits {
@@ -694,7 +717,7 @@ impl Window {
 
         let this = self.clone();
         glib::idle_add_local_once(move || {
-            view.fit_width();
+            view.fit();
             this.sync_zoom_label();
             if let Some(page) = resume.filter(|&p| p > 0) {
                 let v = view.clone();
@@ -706,6 +729,8 @@ impl Window {
     /// A page view wired to this window.
     fn build_pdf_view(&self, bytes: Arc<Vec<u8>>, info: DocumentInfo) -> anyhow::Result<PdfView> {
         let view = PdfView::new(bytes, info)?;
+        view.set_cover_alone(self.0.config.borrow().cover_alone);
+        view.set_layout(self.0.config.borrow().page_layout());
         let n = view.page_count();
         let this = self.clone();
         let update = move |page: usize| {
@@ -922,13 +947,14 @@ impl Window {
         if !self.is_active() {
             return;
         }
-        let zoom = match self.1.doc.borrow().as_ref() {
-            Some(Doc::Pdf { view, .. }) => view.zoom(),
-            Some(Doc::Docx { view, .. }) => view.zoom(),
+        let (zoom, tip) = match self.1.doc.borrow().as_ref() {
+            Some(Doc::Pdf { view, .. }) if view.layout().is_paged() => (view.zoom(), "Fit page (Ctrl+0)"),
+            Some(Doc::Pdf { view, .. }) => (view.zoom(), "Fit width (Ctrl+0)"),
+            Some(Doc::Docx { view, .. }) => (view.zoom(), "Actual size (Ctrl+0)"),
             None => return,
         };
         self.0.zoom_label.set_label(&format!("{:.0}%", zoom * 100.0));
-        self.0.zoom_label.set_tooltip_text(Some(if self.is_pdf() { "Fit width (Ctrl+0)" } else { "Actual size (Ctrl+0)" }));
+        self.0.zoom_label.set_tooltip_text(Some(tip));
     }
 
     /// Zoom by `factor`, or back to fitting (`None`): a PDF to the window's
@@ -937,7 +963,7 @@ impl Window {
         match self.1.doc.borrow().as_ref() {
             Some(Doc::Pdf { view, .. }) => match factor {
                 Some(f) => view.zoom_by(f),
-                None => view.fit_width(),
+                None => view.fit(),
             },
             Some(Doc::Docx { view, .. }) => view.set_zoom(factor.map_or(1.0, |f| view.zoom() * f)),
             None => {}
@@ -1036,7 +1062,7 @@ impl Window {
             // Pages came or went: build the view afresh, at the same zoom,
             // on the same page.
             let (page, frac) = view.position();
-            let (zoom, fit) = (view.zoom(), view.is_fit_width());
+            let (zoom, fit) = (view.zoom(), view.is_fit());
             let fresh = match self.build_pdf_view(bytes.clone(), info) {
                 Ok(v) => v,
                 Err(e) => return self.toast(&e.to_string()),
@@ -1964,6 +1990,46 @@ impl Window {
         });
         win.add_action(&color);
 
+        let layout = gio::SimpleAction::new_stateful(
+            "page-layout",
+            Some(glib::VariantTy::STRING),
+            &self.0.config.borrow().page_layout().id().to_variant(),
+        );
+        let this = self.clone();
+        layout.connect_activate(move |a, value| {
+            let Some(layout) = value.and_then(|v| v.get::<String>()).and_then(|id| PageLayout::from_id(&id)) else {
+                return;
+            };
+            a.set_state(&layout.id().to_variant());
+            for tab in this.0.tabs.borrow().iter() {
+                this.with_tab(tab.clone()).with_pdf(|v| v.set_layout(layout));
+            }
+            this.active().sync_zoom_label();
+            if let Some(cover) = this.0.window.lookup_action("cover-alone").and_downcast::<gio::SimpleAction>() {
+                cover.set_enabled(layout == PageLayout::Double);
+            }
+            let mut cfg = this.0.config.borrow_mut();
+            cfg.page_layout = layout.id().into();
+            let _ = cfg.save();
+        });
+        win.add_action(&layout);
+
+        // Only pairs have a cover to set apart.
+        let cover = gio::SimpleAction::new_stateful("cover-alone", None, &self.0.config.borrow().cover_alone.to_variant());
+        cover.set_enabled(self.0.config.borrow().page_layout() == PageLayout::Double);
+        let this = self.clone();
+        cover.connect_activate(move |a, _| {
+            let alone = !a.state().and_then(|s| s.get::<bool>()).unwrap_or(false);
+            a.set_state(&alone.to_variant());
+            for tab in this.0.tabs.borrow().iter() {
+                this.with_tab(tab.clone()).with_pdf(|v| v.set_cover_alone(alone));
+            }
+            let mut cfg = this.0.config.borrow_mut();
+            cfg.cover_alone = alone;
+            let _ = cfg.save();
+        });
+        win.add_action(&cover);
+
         let dark = gio::SimpleAction::new_stateful("dark-pages", None, &self.0.config.borrow().dark_pages.to_variant());
         let this = self.clone();
         dark.connect_activate(move |a, _| {
@@ -2076,8 +2142,8 @@ impl Window {
         self.1.root.add_controller(focus);
     }
 
-    /// What belongs to the window as a whole: closing it, and the N and P
-    /// page keys.
+    /// What belongs to the window as a whole: closing it, and the keys that
+    /// turn the page.
     fn connect_window(&self) {
         let this = self.clone();
         self.0.window.connect_close_request(move |window| {
@@ -2100,23 +2166,33 @@ impl Window {
         // N and P turn the page — unless something that takes typing has
         // the focus, where they are letters: a search, a note, a document.
         // As window shortcuts they would be taken before any text field saw
-        // them.
+        // them. In a paged layout ← → and Page Up / Down turn it too, except
+        // in the sidebar, whose lists they move through.
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let this = self.clone();
         keys.connect_key_pressed(move |_, key, _, state| {
+            use gdk::Key;
             let modifiers = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK;
-            if state.intersects(modifiers) || !matches!(key, gdk::Key::n | gdk::Key::p) {
+            let paging = matches!(key, Key::Left | Key::Right | Key::Page_Up | Key::Page_Down);
+            if state.intersects(modifiers) || !(paging || matches!(key, Key::n | Key::p)) {
                 return glib::Propagation::Proceed;
             }
-            let typing = gtk::prelude::GtkWindowExt::focus(&this.0.window).is_some_and(|w| {
+            let focus = gtk::prelude::GtkWindowExt::focus(&this.0.window);
+            let typing = focus.as_ref().is_some_and(|w| {
                 w.is::<gtk::Editable>() || w.downcast_ref::<gtk::TextView>().is_some_and(|t| t.is_editable())
             });
             let active = this.active();
-            if typing || !active.is_pdf() {
+            let Some((view, _)) = active.pdf().filter(|_| !typing) else {
                 return glib::Propagation::Proceed;
+            };
+            if paging {
+                let in_sidebar = active.1.split.sidebar().is_some_and(|bar| focus.is_some_and(|w| w.is_ancestor(&bar)));
+                if !view.layout().is_paged() || in_sidebar {
+                    return glib::Propagation::Proceed;
+                }
             }
-            active.with_pdf(|v| if key == gdk::Key::n { v.next_page() } else { v.prev_page() });
+            if matches!(key, Key::n | Key::Right | Key::Page_Down) { view.next_page() } else { view.prev_page() }
             glib::Propagation::Stop
         });
         self.0.window.add_controller(keys);
@@ -2415,6 +2491,7 @@ impl Window {
             ("Fit width / actual size", "Ctrl+0"),
             ("Scroll sideways when zoomed in", "Shift+scroll · the scrollbar"),
             ("Next / previous page", "N / P (away from text) · Ctrl+PgDn / PgUp"),
+            ("Turn the page (Single Page and Two Pages layouts)", "← / → · PgUp / PgDn · click either side"),
             ("Go to page", "Ctrl+G"),
             ("First / last page", "Ctrl+Home / Ctrl+End"),
             ("Toggle sidebar", "F9"),
@@ -2560,6 +2637,7 @@ impl Tab {
         Tab {
             root,
             split,
+            side_stack,
             content,
             overlay,
             outline,
@@ -3063,6 +3141,147 @@ mod drive {
             let _ = WidgetExt::activate_action(&w.0.window, "win.new-window", None);
             pump(300);
             assert_eq!(app.windows().len(), 2);
+        });
+    }
+
+    /// Pages in the column's row that are on show.
+    fn shown_pages(view: &PdfView) -> Vec<usize> {
+        let viewport = view.widget().child().unwrap();
+        let column = viewport.first_child().unwrap();
+        let mut shown = Vec::new();
+        let mut child = column.first_child();
+        let mut i = 0;
+        while let Some(c) = child {
+            if c.is_visible() {
+                shown.push(i);
+            }
+            i += 1;
+            child = c.next_sibling();
+        }
+        shown
+    }
+
+    /// The page layouts: `GDK_BACKEND=broadway XDG_CONFIG_HOME=… RAVEN_DRIVE_DIR=…
+    /// RAVEN_DRIVE_PDF=book.pdf cargo test drive_page_layouts -- --ignored --nocapture`
+    /// with a PDF of six pages or more.
+    #[test]
+    #[ignore]
+    fn drive_page_layouts() {
+        crate::gtk_test::run(|| {
+            adw::init().unwrap();
+            crate::theme::apply();
+            let app = adw::Application::builder()
+                .application_id("com.ravenviewer.RavenDriveLayouts")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            let w = Window::new(&app);
+            w.1.content.set_transition_type(gtk::StackTransitionType::None);
+            w.0.window.set_default_size(1100, 800);
+            w.present();
+            pump(300);
+            w.open(gio::File::for_path(std::env::var("RAVEN_DRIVE_PDF").unwrap()));
+            pump(1500);
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"continuous".to_variant()));
+            pump(700);
+            let (view, _) = w.active().pdf().unwrap();
+            assert!(view.page_count() >= 6, "needs a PDF of six pages or more");
+            let continuous_zoom = view.zoom();
+            view.go_to(3, 0.0);
+            pump(400);
+            assert_eq!(view.current_page(), 3);
+            shot(&w, "layout-1-continuous");
+
+            // Broadway lays out only on frames something asks for; a real
+            // display has them coming anyway.
+            let act = |name: &str, target: Option<&glib::Variant>| {
+                let _ = WidgetExt::activate_action(&w.0.window, name, target);
+                for _ in 0..20 {
+                    w.0.window.queue_draw();
+                    pump(35);
+                }
+            };
+            act("win.page-layout", Some(&"single".to_variant()));
+            assert_eq!(view.layout(), PageLayout::Single);
+            assert_eq!(view.current_page(), 3, "switching keeps the page being read");
+            assert_eq!(shown_pages(&view), vec![3]);
+            assert!(view.zoom() < continuous_zoom, "a whole page fits the window: {} vs {continuous_zoom}", view.zoom());
+            shot(&w, "layout-2-single");
+            act("win.next-page", None);
+            assert_eq!((view.current_page(), shown_pages(&view)), (4, vec![4]));
+            act("win.prev-page", None);
+            act("win.prev-page", None);
+            assert_eq!((view.current_page(), shown_pages(&view)), (2, vec![2]));
+            shot(&w, "layout-3-single-turned");
+
+            act("win.page-layout", Some(&"double".to_variant()));
+            assert_eq!((view.current_page(), shown_pages(&view)), (2, vec![2, 3]));
+            shot(&w, "layout-4-double");
+            act("win.next-page", None);
+            assert_eq!((view.current_page(), shown_pages(&view)), (4, vec![4, 5]));
+            act("win.prev-page", None);
+            assert_eq!((view.current_page(), shown_pages(&view)), (2, vec![2, 3]));
+            act("win.first-page", None);
+            assert_eq!(shown_pages(&view), vec![0, 1]);
+            act("win.prev-page", None);
+            assert_eq!(shown_pages(&view), vec![0, 1], "nothing before the first pair");
+            act("win.last-page", None);
+            let last = view.page_count() - 1;
+            assert_eq!(*shown_pages(&view).last().unwrap(), last);
+            act("win.next-page", None);
+            assert_eq!(*shown_pages(&view).last().unwrap(), last, "nothing after the last pair");
+            // A jump to the right-hand page shows its pair.
+            view.go_to(3, 0.0);
+            pump(400);
+            assert_eq!(shown_pages(&view), vec![2, 3]);
+            shot(&w, "layout-4b-jumped-to-page-4");
+            // A point on the right page is on the right page.
+            let width = view.widget().width() as f64;
+            let height = view.widget().height() as f64;
+            assert_eq!(view.spot_at(width * 0.75, height * 0.5).map(|s| s.page), Some(3));
+            assert_eq!(view.spot_at(width * 0.25, height * 0.5).map(|s| s.page), Some(2));
+            // Zoomed in and back to the window.
+            act("win.zoom-in", None);
+            act("win.zoom-in", None);
+            shot(&w, "layout-5-double-zoomed");
+            act("win.fit", None);
+            assert!(view.is_fit());
+            shot(&w, "layout-6-double-fit");
+
+            // The cover on its own: 1, 2–3, 4–5…
+            let cover_enabled = || w.0.window.lookup_action("cover-alone").is_some_and(|a| a.is_enabled());
+            assert!(cover_enabled(), "offered in the two-page layout");
+            act("win.first-page", None);
+            act("win.cover-alone", None);
+            assert!(view.cover_alone());
+            assert_eq!(shown_pages(&view), vec![0]);
+            shot(&w, "layout-6c-cover-alone");
+            act("win.next-page", None);
+            assert_eq!(shown_pages(&view), vec![1, 2]);
+            shot(&w, "layout-6d-cover-alone-pair");
+            act("win.next-page", None);
+            assert_eq!(shown_pages(&view), vec![3, 4]);
+            act("win.prev-page", None);
+            act("win.prev-page", None);
+            assert_eq!(shown_pages(&view), vec![0], "back to the cover");
+            view.go_to(2, 0.0);
+            pump(400);
+            assert_eq!(shown_pages(&view), vec![1, 2], "page 3 is shown with page 2");
+            // Off again: page 2 is now paired with page 1.
+            act("win.cover-alone", None);
+            assert!(!view.cover_alone());
+            assert_eq!(shown_pages(&view), vec![0, 1]);
+            assert!(!w.0.config.borrow().cover_alone);
+            act("win.next-page", None);
+
+            act("win.page-layout", Some(&"continuous".to_variant()));
+            shot(&w, "layout-7-back-to-continuous");
+            assert!(!cover_enabled(), "nothing to set apart in a column");
+            assert_eq!(view.layout(), PageLayout::Continuous);
+            assert_eq!(shown_pages(&view).len(), view.page_count());
+            assert_eq!(view.current_page(), 2);
+            assert!((view.zoom() - continuous_zoom).abs() < 0.01);
+            assert_eq!(w.0.config.borrow().page_layout(), PageLayout::Continuous);
         });
     }
 
