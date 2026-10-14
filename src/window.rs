@@ -25,7 +25,7 @@ use crate::docx::{ParaStyle, TextDefaults};
 use crate::docxview::{self, DocxView, Inline};
 use crate::pdf::{self, DocumentInfo};
 use crate::pdfedit::{self, Edit, Markup};
-use crate::pdfview::{PdfView, Spot};
+use crate::pdfview::{Found, PdfView, Spot};
 use crate::{docx, theme};
 
 pub const APP_ID: &str = "com.ravenviewer.Raven";
@@ -982,13 +982,13 @@ impl Window {
             Some(Doc::Pdf { view, search, .. }) => (view.clone(), search.clone()),
             _ => return,
         };
+        view.set_search(&query);
         let this = self.clone();
         glib::spawn_future_local(async move {
-            let start = view.current_page();
-            match search.find(&query, start, backwards).await {
-                Some(page) if page == start => this.toast("Only match is on this page"),
-                Some(page) => view.go_to(page, 0.0),
-                None => this.toast(&format!("No matches for “{query}”")),
+            match view.find_next(&search, backwards).await {
+                Found::Match | Found::Stale => {}
+                Found::OnlyMatch => this.toast("This is the only match"),
+                Found::Nothing => this.toast(&format!("No matches for “{query}”")),
             }
         });
     }
@@ -2111,8 +2111,31 @@ impl Window {
             });
         }
 
+        // Matches are marked as the words are typed; Enter goes to them.
+        let this = self.clone();
+        self.1.search.connect_search_changed(move |entry| {
+            let query = entry.text();
+            this.with_pdf(|v| v.set_search(query.trim()));
+        });
+        let this = self.clone();
+        self.1.search_bar.connect_search_mode_enabled_notify(move |bar| {
+            if !bar.is_search_mode() {
+                this.with_pdf(|v| v.set_search(""));
+            }
+        });
         let this = self.clone();
         self.1.search.connect_activate(move |_| this.find_next(false));
+        // Shift+Enter goes back, as in a browser.
+        let back = gtk::EventControllerKey::new();
+        let this = self.clone();
+        back.connect_key_pressed(move |_, key, _, state| {
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) && state.contains(gdk::ModifierType::SHIFT_MASK) {
+                this.find_next(true);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.1.search.add_controller(back);
         let this = self.clone();
         self.1.search.connect_next_match(move |_| this.find_next(false));
         let this = self.clone();
@@ -2479,7 +2502,7 @@ impl Window {
             ("Close tab / close window", "Ctrl+W / Ctrl+Shift+W"),
             ("Save / Save As", "Ctrl+S / Ctrl+Shift+S"),
             ("Export as PDF", "Ctrl+Shift+E"),
-            ("Find", "Ctrl+F · Enter for next"),
+            ("Find", "Ctrl+F · Enter / Shift+Enter for next / previous match"),
             ("Select text", "Drag · double-click a word · triple-click a line"),
             ("Copy selection", "Ctrl+C"),
             ("Highlight selection", "Ctrl+H"),
@@ -3282,6 +3305,93 @@ mod drive {
             assert_eq!(view.current_page(), 2);
             assert!((view.zoom() - continuous_zoom).abs() < 0.01);
             assert_eq!(w.0.config.borrow().page_layout(), PageLayout::Continuous);
+        });
+    }
+
+    /// Search: `GDK_BACKEND=broadway XDG_CONFIG_HOME=… RAVEN_DRIVE_DIR=…
+    /// RAVEN_DRIVE_PDF=book.pdf RAVEN_DRIVE_QUERY="words in the book" cargo test
+    /// drive_search -- --ignored --nocapture`, with words that occur on several
+    /// pages and more than once on some.
+    #[test]
+    #[ignore]
+    fn drive_search() {
+        crate::gtk_test::run(|| {
+            adw::init().unwrap();
+            crate::theme::apply();
+            let app = adw::Application::builder()
+                .application_id("com.ravenviewer.RavenDriveSearch")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            let query = std::env::var("RAVEN_DRIVE_QUERY").unwrap();
+            let w = Window::new(&app);
+            w.1.content.set_transition_type(gtk::StackTransitionType::None);
+            w.0.window.set_default_size(1100, 800);
+            w.present();
+            pump(300);
+            w.open(gio::File::for_path(std::env::var("RAVEN_DRIVE_PDF").unwrap()));
+            pump(1500);
+            let settle = |ms: u64| {
+                for _ in 0..ms / 35 {
+                    w.0.window.queue_draw();
+                    pump(35);
+                }
+            };
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"continuous".to_variant()));
+            settle(700);
+            let (view, _) = w.active().pdf().unwrap();
+            let _ = WidgetExt::activate_action(&w.0.window, "win.find", None);
+            w.1.search.set_text(&query);
+            settle(600);
+            assert_eq!(view.search_position(), Some(None), "typing marks matches but goes nowhere yet");
+
+            // Forward through the document: positions only ever move on.
+            let mut seen = Vec::new();
+            for step in 0..8 {
+                w.1.search.emit_activate();
+                settle(1200);
+                let at = view.search_position().flatten().expect("Enter goes to a match");
+                eprintln!("step {step}: page {} match {:?}, reading page {}", at.0 + 1, at.1, view.current_page() + 1);
+                if let Some(&before) = seen.last() {
+                    assert!(at > before, "{at:?} should come after {before:?}");
+                }
+                seen.push(at);
+                if step == 1 {
+                    shot(&w, "search-1-match");
+                }
+            }
+            assert!(seen.windows(2).any(|p| p[0].0 == p[1].0), "steps through matches on one page: {seen:?}");
+            assert!(seen.windows(2).any(|p| p[0].0 != p[1].0), "and on to other pages: {seen:?}");
+            // Shift+Enter: back one.
+            w.active().find_next(true);
+            settle(1200);
+            assert_eq!(view.search_position().flatten(), Some(seen[seen.len() - 2]));
+            shot(&w, "search-2-back");
+
+            // In a paged layout, the match's page is turned to.
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"double".to_variant()));
+            settle(700);
+            w.1.search.emit_activate();
+            settle(1200);
+            let (page, _) = view.search_position().flatten().unwrap();
+            assert!(page / 2 * 2 == view.current_page(), "page {page} is in the pair on show");
+            // Broadway lays the newly shown pair out only for a capture; the
+            // second shows it settled.
+            shot(&w, "search-3-two-pages");
+            shot(&w, "search-3-two-pages");
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"continuous".to_variant()));
+            settle(700);
+
+            // Words that are nowhere.
+            w.1.search.set_text("zqxjvw nowhere");
+            settle(300);
+            w.1.search.emit_activate();
+            settle(3000);
+            assert_eq!(view.search_position(), Some(None));
+            // Closing the search bar clears the marks.
+            w.1.search_bar.set_search_mode(false);
+            settle(300);
+            assert_eq!(view.search_position(), None);
         });
     }
 

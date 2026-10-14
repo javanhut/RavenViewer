@@ -246,6 +246,27 @@ impl PageText {
         out
     }
 
+    /// Every place `query` occurs, as caret ranges `(from, to)`. The query is
+    /// compared the way search compares it (see `pdf::normalize`): case,
+    /// spacing and ligatures aside, so a match search found on the page can
+    /// be found again here, where the characters have boxes.
+    pub fn find(&self, query: &str) -> Vec<(usize, usize)> {
+        let query = crate::pdf::normalize(query);
+        if query.is_empty() {
+            return Vec::new();
+        }
+        // The page's text as search sees it, and for each byte of it the
+        // character it came from.
+        let mut text = String::new();
+        let mut owner = Vec::new();
+        for (i, c) in self.chars.iter().enumerate() {
+            let piece = crate::pdf::normalize(&c.text);
+            owner.extend(std::iter::repeat_n(i, piece.len()));
+            text.push_str(&piece);
+        }
+        text.match_indices(&query).map(|(at, m)| (owner[at], owner[at + m.len() - 1] + 1)).collect()
+    }
+
     /// One box per line piece covering `from..to`, as page fractions — what
     /// the view paints for a selection.
     pub fn boxes(&self, from: usize, to: usize) -> Vec<[f32; 4]> {
@@ -412,6 +433,30 @@ pub(crate) mod tests {
     fn page_text(bytes: Vec<u8>) -> PageText {
         let pdf = Pdf::new(bytes).unwrap();
         extract(&pdf.pages()[0])
+    }
+
+    /// Search finds words however the page spaced them, across a line
+    /// break, and in any case; each match is a run of characters with boxes.
+    #[test]
+    fn finds_every_match_with_its_characters() {
+        let text = page_text(sample_pdf(0));
+        // "Hello world\nSecond line": the second line has no space glyph.
+        let hits = text.find("o");
+        assert_eq!(hits.len(), 3, "hellO wOrld secOnd");
+        for &(from, to) in &hits {
+            assert_eq!(text.text(from, to), "o");
+        }
+        let hits = text.find("SECOND LINE");
+        assert_eq!(hits.len(), 1);
+        let (from, to) = hits[0];
+        assert_eq!(text.text(from, to), "Second line");
+        assert_eq!(text.boxes(from, to).len(), 1, "one line, one box");
+        // Across the break between the lines.
+        let hits = text.find("world second");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(text.boxes(hits[0].0, hits[0].1).len(), 2, "a box on each line");
+        assert!(text.find("absent").is_empty());
+        assert!(text.find("   ").is_empty(), "spaces alone match nothing");
     }
 
     #[test]

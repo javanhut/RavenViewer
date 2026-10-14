@@ -14,6 +14,8 @@
 //! Text can be selected like in any reader: drag across it, double-click a
 //! word, triple-click a line, Shift+click to extend. Where the characters are
 //! comes from `pdftext`, asked for page by page as pages come on screen.
+//! The same characters place search matches: every match on the pages near
+//! the viewport is marked, the current one more strongly.
 //!
 //! Besides the continuous column there are two paged layouts: one page, or
 //! two side by side, at a time. The same row of pages is used, laid on its
@@ -83,6 +85,34 @@ enum Turn {
     Previous,
     Next,
 }
+
+/// What a search step came to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Found {
+    /// A match, now the current one and on screen.
+    Match,
+    /// The current match is the only one in the document.
+    OnlyMatch,
+    Nothing,
+    /// The query changed, or another step started, while this one looked.
+    Stale,
+}
+
+/// The search being shown.
+struct Search {
+    /// As `pdf::normalize` has it.
+    query: String,
+    /// The current match: its page and which of that page's matches. A page
+    /// the searcher found the words on but whose characters do not hold them
+    /// (the two read text differently) is current with no match.
+    at: Option<(usize, Option<usize>)>,
+}
+
+/// A page's matches for the search, as caret ranges into its text.
+type Matches = Rc<Vec<(usize, usize)>>;
+
+const SEARCH_MATCH: gdk::RGBA = gdk::RGBA::new(1.0, 0.82, 0.0, 0.38);
+const SEARCH_CURRENT: gdk::RGBA = gdk::RGBA::new(1.0, 0.5, 0.0, 0.6);
 
 /// A press that may turn out to be a tap on the side of a paged view.
 #[derive(Clone, Copy)]
@@ -181,8 +211,15 @@ struct Inner {
     /// old copy is dropped.
     text_epoch: Cell<u64>,
     selection: Cell<Option<Selection>>,
-    /// Pages with selection boxes drawn on them.
+    /// Pages with selection or search boxes drawn on them.
     marked: RefCell<HashSet<usize>>,
+    search: RefCell<Option<Search>>,
+    /// Each page's matches for the search, found once its text is in.
+    matches: RefCell<HashMap<usize, Matches>>,
+    /// Bumped by every search step, so an older one still looking gives up.
+    search_step: Cell<u64>,
+    /// The pages on screen, `first..=last`, for marking matches near them.
+    on_screen: Cell<(usize, usize)>,
     press: Cell<Press>,
     /// The pointer during a selection drag, in scroller coordinates.
     drag_at: Cell<Option<(f64, f64)>>,
@@ -294,6 +331,10 @@ impl PdfView {
             text_epoch: Cell::new(0),
             selection: Cell::new(None),
             marked: Default::default(),
+            search: RefCell::new(None),
+            matches: Default::default(),
+            search_step: Cell::new(0),
+            on_screen: Cell::new((0, 0)),
             press: Cell::new(Press::default()),
             drag_at: Cell::new(None),
             autoscroll: RefCell::new(None),
@@ -336,6 +377,7 @@ impl PdfView {
         self.inner.text_epoch.set(self.inner.text_epoch.get() + 1);
         self.inner.texts.borrow_mut().clear();
         self.inner.asked.borrow_mut().clear();
+        self.inner.matches.borrow_mut().clear();
         self.set_selection(None);
         self.update_visible();
         true
@@ -1057,6 +1099,12 @@ impl PdfView {
         }
         self.inner.renderer.borrow().submit(scale, wanted);
 
+        // Matches are marked near the viewport only; pages whose text was
+        // read before need them put back as they come round again.
+        if self.inner.on_screen.replace((first, last)) != (first, last) && self.inner.search.borrow().is_some() {
+            self.paint_selection();
+        }
+
         // The text of what is on screen, so it can be selected the moment
         // the reader reaches for it.
         for page in first..=last.min(n - 1) {
@@ -1241,16 +1289,31 @@ impl PdfView {
         }
     }
 
+    /// Draw the search matches near the viewport and the selection over
+    /// them.
     fn paint_selection(&self) {
         let color = SELECTION_COLOR.with(Cell::get);
         let mut now: HashMap<usize, Vec<([f32; 4], gdk::RGBA)>> = HashMap::new();
+        if let Some(at) = self.inner.search.borrow().as_ref().map(|s| s.at) {
+            let (first, last) = self.inner.on_screen.get();
+            let near = first.saturating_sub(KEEP)..=last.saturating_add(KEEP);
+            for page in near.filter(|&p| p < self.page_count()) {
+                let Some(matches) = self.matches_on(page) else { continue };
+                let texts = self.inner.texts.borrow();
+                let Some(text) = texts.get(&page) else { continue };
+                for (k, &(from, to)) in matches.iter().enumerate() {
+                    let color = if at == Some((page, Some(k))) { SEARCH_CURRENT } else { SEARCH_MATCH };
+                    now.entry(page).or_default().extend(text.boxes(from, to).into_iter().map(|b| (b, color)));
+                }
+            }
+        }
         if let Some((start, end)) = self.inner.selection.get().filter(|s| !s.is_empty()).map(|s| s.ordered()) {
             let texts = self.inner.texts.borrow();
             for page in start.0..=end.0 {
                 let Some(text) = texts.get(&page) else { continue };
                 let from = if page == start.0 { start.1 } else { 0 };
                 let to = if page == end.0 { end.1 } else { text.chars.len() };
-                now.insert(page, text.boxes(from, to).into_iter().map(|b| (b, color)).collect());
+                now.entry(page).or_default().extend(text.boxes(from, to).into_iter().map(|b| (b, color)));
             }
         }
         let mut marked = self.inner.marked.borrow_mut();
@@ -1261,6 +1324,152 @@ impl PdfView {
         for (page, marks) in now {
             self.inner.tiles[page].set_marks(marks);
             marked.insert(page);
+        }
+    }
+
+    // ── Search ──────────────────────────────────────────────────────────
+
+    /// Mark every match of `query` near the viewport; empty clears them.
+    /// The current match is forgotten when the query changes.
+    pub fn set_search(&self, query: &str) {
+        let query = crate::pdf::normalize(query);
+        let current = self.inner.search.borrow().as_ref().map(|s| s.query.clone());
+        if current.as_deref().unwrap_or_default() == query {
+            return;
+        }
+        *self.inner.search.borrow_mut() = (!query.is_empty()).then_some(Search { query, at: None });
+        self.inner.matches.borrow_mut().clear();
+        self.paint_selection();
+        // The text of the pages near the viewport, for their matches.
+        if self.inner.search.borrow().is_some() {
+            let (first, last) = self.inner.on_screen.get();
+            for page in first..=last.min(self.page_count().saturating_sub(1)) {
+                self.request_text(page);
+            }
+        }
+    }
+
+    /// A page's matches, once its text has been read.
+    fn matches_on(&self, page: usize) -> Option<Matches> {
+        if let Some(found) = self.inner.matches.borrow().get(&page) {
+            return Some(found.clone());
+        }
+        let query = self.inner.search.borrow().as_ref()?.query.clone();
+        let found = Rc::new(self.inner.texts.borrow().get(&page)?.find(&query));
+        self.inner.matches.borrow_mut().insert(page, found.clone());
+        Some(found)
+    }
+
+    /// A page's matches, reading its text first if need be.
+    async fn load_matches(&self, page: usize) -> Matches {
+        if let Some(found) = self.matches_on(page) {
+            return found;
+        }
+        let layer = self.inner.text.borrow().clone();
+        let epoch = self.inner.text_epoch.get();
+        if let Some(text) = layer.page(page).await
+            && self.inner.text_epoch.get() == epoch
+        {
+            self.inner.texts.borrow_mut().insert(page, text);
+        }
+        self.matches_on(page).unwrap_or_default()
+    }
+
+    /// Move to the next match (or the previous one): through the matches
+    /// on the current match's page — or, starting out, the page being read —
+    /// then on to the next page `searcher` finds the words on, wrapping
+    /// round the document.
+    pub async fn find_next(&self, searcher: &crate::pdf::Searcher, backwards: bool) -> Found {
+        let Some((query, at)) = self.inner.search.borrow().as_ref().map(|s| (s.query.clone(), s.at)) else {
+            return Found::Nothing;
+        };
+        let step = self.inner.search_step.get() + 1;
+        self.inner.search_step.set(step);
+        let stale = |view: &PdfView| {
+            view.inner.search_step.get() != step || view.inner.search.borrow().as_ref().is_none_or(|s| s.query != query)
+        };
+        let edge = |count: usize| (count > 0).then(|| if backwards { count - 1 } else { 0 });
+
+        let here = at.map_or(self.current_page(), |(page, _)| page);
+        let matches = self.load_matches(here).await;
+        if stale(self) {
+            return Found::Stale;
+        }
+        let within = match at {
+            Some((_, Some(i))) if backwards => i.checked_sub(1),
+            Some((_, Some(i))) => Some(i + 1).filter(|&next| next < matches.len()),
+            Some((_, None)) => None,
+            None => edge(matches.len()),
+        };
+        if let Some(i) = within {
+            self.show_match(here, Some(i));
+            return Found::Match;
+        }
+
+        // The searcher looks at `here` last, so it answers `here` only when
+        // no other page has the words. Its text and the page's characters
+        // can disagree; matches here still count when it finds none.
+        let found = searcher.find(&query, here, backwards).await;
+        if stale(self) {
+            return Found::Stale;
+        }
+        let Some(page) = found.or_else(|| (!matches.is_empty()).then_some(here)) else {
+            return Found::Nothing;
+        };
+        let matches = if page == here { matches } else { self.load_matches(page).await };
+        if stale(self) {
+            return Found::Stale;
+        }
+        let index = edge(matches.len());
+        if page == here && at == Some((here, index)) {
+            return Found::OnlyMatch;
+        }
+        self.show_match(page, index);
+        Found::Match
+    }
+
+    /// Whether a search is on, and where its current match is.
+    #[cfg(test)]
+    pub fn search_position(&self) -> Option<Option<(usize, Option<usize>)>> {
+        self.inner.search.borrow().as_ref().map(|s| s.at)
+    }
+
+    fn show_match(&self, page: usize, index: Option<usize>) {
+        if let Some(search) = self.inner.search.borrow_mut().as_mut() {
+            search.at = Some((page, index));
+        }
+        let bounds = index.and_then(|i| {
+            let (from, to) = *self.matches_on(page)?.get(i)?;
+            let boxes = self.inner.texts.borrow().get(&page)?.boxes(from, to);
+            boxes.into_iter().reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+        });
+        self.bring_into_view(page, bounds);
+        self.paint_selection();
+    }
+
+    /// Scroll as little as it takes to show a box on a page (page
+    /// fractions): not at all when it is already on screen.
+    fn bring_into_view(&self, page: usize, bounds: Option<[f32; 4]>) {
+        let Some(b) = bounds else {
+            self.go_to(page, 0.0);
+            return;
+        };
+        let (start, end) = self.inner.shown.get();
+        if self.layout().is_paged() && !(start..end).contains(&page) {
+            self.go_to(page, b[1] as f64);
+            return;
+        }
+        let (left, top, width, height) = self.page_rect(page);
+        let (x0, x1) = (left + b[0] as f64 * width, left + b[2] as f64 * width);
+        let (y0, y1) = (top + b[1] as f64 * height, top + b[3] as f64 * height);
+        let hadj = self.inner.scroller.hadjustment();
+        if x0 < hadj.value() || x1 > hadj.value() + hadj.page_size() {
+            hadj.set_value((x0 + x1 - hadj.page_size()) / 2.0);
+        }
+        let vadj = self.inner.scroller.vadjustment();
+        if y0 < vadj.value() || y1 > vadj.value() + vadj.page_size() {
+            // A third of the way down, where the eye starts reading.
+            self.scroll_to(y0 - vadj.page_size() / 3.0);
         }
     }
 
