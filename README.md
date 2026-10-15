@@ -12,11 +12,13 @@ installed alongside: everything is done by Raven Viewer itself.
 | | |
 |---|---|
 | **PDF** | Continuous pages, rendered in pure Rust ([hayro](https://github.com/LaurenzV/hayro)) on background threads; only pages near the viewport are rasterized, so a 700-page book opens in ~0.2s |
+| **TIFF scans** | `.tif` / `.tiff` open as pages — one page or many; uncompressed, LZW, Deflate, PackBits, CCITT fax (G3/G4) and JPEG; black-and-white, grey, colour, palette, CMYK; each page at the size its resolution gives (faxes' unequal resolutions included) and turned upright when the file says so. Everything a PDF does works on them (layouts, zoom, notes, rotating and deleting pages, Combine); saving writes a PDF beside the scan, never over it. Their words are read off the page (see **Scanned text**) |
 | **Page layout** | Menu → Page Layout: **Continuous** (one long column), **Single Page** or **Two Pages** side by side, turned left and right. Turn by clicking or tapping the left or right third of the view, `←` / `→` or `PgUp` / `PgDn`, the wheel or a touchpad swipe once the page can scroll no further, or a sideways swipe on a touchscreen. Pages fit the window (`Ctrl+0` re-fits). Pairs run 1–2, 3–4…, or with Page Layout → Cover on Its Own the first page stands alone and pairs run 2–3, 4–5…, as in a printed book |
 | **Jumping** | Fling the scrollbar or jump to a chapter and the page you land on is drawn first — work for pages you scrolled past is dropped, not queued |
 | **Go to page** | Click the page counter or `Ctrl+G`; `Ctrl+Home` / `Ctrl+End` for the ends |
 | **Contents** | The document outline in the sidebar, open whenever a PDF has one; click a chapter to jump |
 | **Notes** | Annotations (comments, highlights, stamps…) listed with their page; click to jump to the spot |
+| **Scanned text** | A scan is a picture of text, so its words are read off the page (OCR, by [ocrs](https://github.com/robertknight/ocrs), pure Rust) and can then be searched, selected and copied like a PDF's own. Applies to TIFFs and to any PDF page that is a scan with no text layer. The page on screen is read as it comes into view; search reads pages as it reaches them, a second or two each, saying which beside the search box — once read, a page is searched instantly. English and other Latin-alphabet text; handwriting is not read |
 | **Search** | `Ctrl+F`: matches are highlighted on the page as you type, the current one in orange. Enter goes to the next match, Shift+Enter the previous, through every match on a page before moving on, scrolling only when the match is off screen. Pages are searched lazily from where you are and stop at the first hit; tolerant of lost word spaces and ligatures |
 | **Zoom** | Fit width by default; `Ctrl` + scroll, pinch, `Ctrl++` / `Ctrl+−`, `Ctrl+0` to re-fit. Word and text documents zoom too (`Ctrl+0` back to actual size). Zoomed wider than the window, a page is scrolled sideways, with a scrollbar that stays visible (or Shift + scroll). Past the point where a whole page is a sensible thing to draw, PDF pages are tiled and only the tiles on screen are rasterized, so 800% costs a screenful rather than a page |
 | **Tabs** | Every document opens in a tab of its own (`Ctrl+Tab` / `Alt+1…9` to switch, `Ctrl+W` to close; unsaved changes are asked about). Opening a file that is already open shows its tab. Files opened from the file manager go into the window in use |
@@ -88,9 +90,18 @@ opening from the file manager or a browser download is instant.
 make            # release build
 make run FILE=book.pdf
 sudo make install && raven-viewer set-default
+make ocr-models # the text recognition models for scans, into data/ocr
 ```
 
 or with ImLazy: `imlazy build`, `imlazy dev -- book.pdf`, `imlazy install`.
+
+Reading scans needs ocrs's two models (about 12 MB), which are data, not
+code: `make ocr-models` downloads them once into `data/ocr`, a build run
+from the checkout finds them there, and `make install` (which fetches them
+if need be) puts them in `share/raven-viewer/ocr`. They are also found in
+`~/.local/share/raven-viewer/ocr`, or wherever `RAVEN_OCR_MODELS` points.
+Without them everything else works, and searching a scan says what is
+missing.
 
 No C toolchain beyond what GTK already needs, no libclang. PDF export uses
 the Pango and Cairo that GTK already brings; no other application is needed
@@ -135,7 +146,17 @@ GDK_BACKEND=broadway BROADWAY_DISPLAY=:7 RAVEN_DRIVE_DIR=/tmp/shots \
   RAVEN_DRIVE_FIXTURES=fixtures cargo test drive_documents -- --ignored --nocapture
 # what a real .doc reads as (and it written back as DOCX, PDF and .doc):
 RAVEN_TEST_DOC=a.doc cargo test doc_real -- --ignored --nocapture
+# pages of a PDF scanned at 300 dpi, read back, and scored against the
+# PDF's own words (RAVEN_OCR_OUT keeps the scans, together as scans.tif):
+RAVEN_OCR_PDF=book.pdf RAVEN_OCR_PAGES=5,20 cargo test reads_scanned_pages -- --ignored --nocapture
+# a scanned TIFF in the window: its text selected and copied, then
+# searched for words on its last page:
+GDK_BACKEND=broadway BROADWAY_DISPLAY=:7 RAVEN_DRIVE_DIR=/tmp/shots \
+  RAVEN_DRIVE_SCAN=scans.tif RAVEN_DRIVE_QUERY="word" cargo test drive_ocr -- --ignored --nocapture
 ```
+
+The tests that read scans need the models (`make ocr-models`); without
+them they say so and pass.
 
 GTK tests run on one shared GTK thread (`gtk_test::run`), so they run
 rather than quietly skipping when the harness puts them on another thread.
@@ -186,6 +207,16 @@ formatting, tables, pictures, page setup — so headers, footers, notes and
 comments in a `.doc` you overwrite are not kept, which is why Raven Viewer
 asks first. Word 6 and Word 95 files, and password-protected ones, are
 refused with a message rather than misread.
+
+A **scan** (`ocr.rs`) is any page with no text of its own whose pictures
+cover at least 30% of it. It is drawn at its scan's resolution (200–300 dpi),
+ocrs finds the words and reads them line by line, and each character comes
+back with its box in the page's own coordinates — the same shape the text
+layer collects from a PDF's glyphs, so selection, search and highlighting
+need nothing special for it. Pages are remembered by a fingerprint of their
+pictures, so a page is read once even when the view and the search both ask
+for it, or an edit rewrites the file around it. On printed pages about 95–99%
+of words come back right; mistakes are mostly in symbols and maths.
 
 A **text file** is read as UTF-8, UTF-16 (by its byte order mark) or
 Windows-1252, one paragraph per line, and written back as UTF-8.
@@ -243,11 +274,9 @@ crates.io. See `vendor/hayro/RAVEN-PATCH.md`.
 
 ## Roadmap
 
-- Highlight search matches on the page
 - Thumbnails in the sidebar
 - Filling forms
 - Drawing freehand (ink) annotations
-- Search results highlighted on the page (the text layer makes this cheap now)
 - Signing
 - Password-protected PDFs (the engine supports them; the prompt is missing)
 - Resizing pictures in documents; editing table cells

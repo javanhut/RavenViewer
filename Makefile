@@ -10,8 +10,12 @@ DESTDIR   ?=
 PROFILE   ?= release
 CARGO_FLAGS := $(if $(filter release,$(PROFILE)),--release,)
 TARGET_DIR  := target/$(PROFILE)
+# Text recognition for scans: ocrs's two models, fetched once into data/ocr.
+OCR_DIR     := $(DATADIR)/raven-viewer/ocr
+OCR_URL     := https://ocrs-models.s3-accelerate.amazonaws.com
+OCR_MODELS  := data/ocr/text-detection.rten data/ocr/text-recognition.rten
 
-.PHONY: all build run test check clean install uninstall set-default
+.PHONY: all build run test check clean install uninstall set-default ocr-models
 
 all: build
 
@@ -32,6 +36,13 @@ check:
 clean:
 	cargo clean
 
+ocr-models: $(OCR_MODELS)
+
+data/ocr/%.rten:
+	@mkdir -p data/ocr
+	curl -fL --retry 3 -o "$@.part" "$(OCR_URL)/$*.rten"
+	mv "$@.part" "$@"
+
 define update-caches
 	@if [ -z "$(DESTDIR)" ]; then \
 		command -v update-desktop-database >/dev/null 2>&1 && \
@@ -41,11 +52,12 @@ define update-caches
 	fi
 endef
 
-install: build
+install: build ocr-models
 	install -Dm755 "$(TARGET_DIR)/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
 	install -Dm644 "data/$(APP_ID).desktop" "$(DESTDIR)$(DATADIR)/applications/$(APP_ID).desktop"
 	install -Dm644 "data/$(APP_ID).metainfo.xml" "$(DESTDIR)$(DATADIR)/metainfo/$(APP_ID).metainfo.xml"
 	install -Dm644 "data/icons/hicolor/scalable/apps/$(APP_ID).svg" "$(DESTDIR)$(ICONDIR)/$(APP_ID).svg"
+	install -Dm644 -t "$(DESTDIR)$(OCR_DIR)" $(OCR_MODELS)
 	$(update-caches)
 
 set-default:
@@ -56,4 +68,6 @@ uninstall:
 	rm -f "$(DESTDIR)$(DATADIR)/applications/$(APP_ID).desktop"
 	rm -f "$(DESTDIR)$(DATADIR)/metainfo/$(APP_ID).metainfo.xml"
 	rm -f "$(DESTDIR)$(ICONDIR)/$(APP_ID).svg"
+	rm -rf "$(DESTDIR)$(OCR_DIR)"
+	-rmdir "$(DESTDIR)$(DATADIR)/raven-viewer"
 	$(update-caches)

@@ -2,7 +2,10 @@
 //! parsed document; lopdf reads what hayro does not expose (outline,
 //! annotations, text for search). Nothing here touches GTK.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -648,38 +651,91 @@ struct SearchRequest {
     query: String,
     start: usize,
     backwards: bool,
-    reply: async_channel::Sender<Option<usize>>,
+    reply: async_channel::Sender<SearchReply>,
 }
+
+enum SearchReply {
+    /// A scanned page is being read, which takes a second or two.
+    Reading(usize),
+    Done(Option<usize>),
+}
+
+/// Hears which scanned page a search is reading, and `None` once it is done.
+type ReadingHook = Rc<dyn Fn(Option<usize>)>;
 
 /// Text search on its own thread. Extracting text is ~20ms a page, so a
 /// whole book up front is many seconds; instead pages are read lazily in
 /// search order, cached, and a search stops at the first hit. A new query
-/// arriving mid-scan replaces the old one immediately.
+/// arriving mid-scan replaces the old one immediately. A scan's text is
+/// read off the page, a second or two each, and the search says which
+/// page it is reading meanwhile.
 pub struct Searcher {
     tx: mpsc::Sender<SearchRequest>,
+    on_reading: RefCell<Option<ReadingHook>>,
+    /// A scan was met with nothing installed to read it.
+    unreadable: Arc<AtomicBool>,
+    /// Searches asked for so far, so only the latest says it is done.
+    asked: std::cell::Cell<u64>,
 }
 
 impl Searcher {
     pub fn spawn(bytes: Arc<Vec<u8>>, pages: usize) -> Self {
         let (tx, rx) = mpsc::channel::<SearchRequest>();
+        let unreadable = Arc::new(AtomicBool::new(false));
+        let flag = unreadable.clone();
         let _ = std::thread::Builder::new()
             .name("raven-search".into())
-            .spawn(move || search_loop(&bytes, pages, rx));
-        Self { tx }
+            .spawn(move || search_loop(bytes, pages, rx, &flag));
+        Self { tx, on_reading: RefCell::default(), unreadable, asked: Default::default() }
+    }
+
+    pub fn on_reading(&self, f: impl Fn(Option<usize>) + 'static) {
+        *self.on_reading.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Whether a page searched was a scan there was nothing to read with.
+    pub fn met_unreadable_scan(&self) -> bool {
+        self.unreadable.load(Ordering::Relaxed)
     }
 
     /// First page after `start` (wrapping, `start` itself last) whose text
     /// contains `query`, compared case-insensitively.
     pub async fn find(&self, query: &str, start: usize, backwards: bool) -> Option<usize> {
-        let (reply, answer) = async_channel::bounded(1);
+        let (reply, answer) = async_channel::unbounded();
         let req = SearchRequest { query: normalize(query), start, backwards, reply };
-        self.tx.send(req).ok()?;
-        answer.recv().await.ok().flatten()
+        let ask = self.asked.get() + 1;
+        self.asked.set(ask);
+        let tell = |page| {
+            let hook = self.on_reading.borrow().clone();
+            if let Some(hook) = hook {
+                hook(page);
+            }
+        };
+        if self.tx.send(req).is_ok() {
+            while let Ok(reply) = answer.recv().await {
+                match reply {
+                    SearchReply::Reading(page) => tell(Some(page)),
+                    SearchReply::Done(found) => {
+                        tell(None);
+                        return found;
+                    }
+                }
+            }
+        }
+        // Overtaken by a newer search, which tells for itself, or the
+        // search thread is gone.
+        if self.asked.get() == ask {
+            tell(None);
+        }
+        None
     }
 }
 
-fn search_loop(bytes: &[u8], pages: usize, rx: mpsc::Receiver<SearchRequest>) {
-    let doc = lopdf::Document::load_mem(bytes).ok();
+fn search_loop(bytes: Arc<Vec<u8>>, pages: usize, rx: mpsc::Receiver<SearchRequest>, unreadable: &AtomicBool) {
+    let doc = lopdf::Document::load_mem(&bytes).ok();
+    // Drawn pages, for the scans among them: their text is read off them.
+    let drawn = Pdf::new(bytes).ok();
+    let drawn = drawn.as_ref().map(|p| p.pages());
     let mut cache: Vec<Option<String>> = vec![None; pages];
     let mut pending: Option<SearchRequest> = None;
 
@@ -692,7 +748,7 @@ fn search_loop(bytes: &[u8], pages: usize, rx: mpsc::Receiver<SearchRequest>) {
             },
         };
         if pages == 0 || req.query.is_empty() {
-            let _ = req.reply.send_blocking(None);
+            let _ = req.reply.send_blocking(SearchReply::Done(None));
             continue;
         }
         for i in 1..=pages {
@@ -702,14 +758,26 @@ fn search_loop(bytes: &[u8], pages: usize, rx: mpsc::Receiver<SearchRequest>) {
             }
             let page = if req.backwards { (req.start + pages - i % pages) % pages } else { (req.start + i) % pages };
             let text = cache[page].get_or_insert_with(|| {
-                normalize(&doc.as_ref().and_then(|d| d.extract_text(&[page as u32 + 1]).ok()).unwrap_or_default())
+                let own =
+                    normalize(&doc.as_ref().and_then(|d| d.extract_text(&[page as u32 + 1]).ok()).unwrap_or_default());
+                let Some(drawn) = drawn.as_ref().and_then(|d| d.get(page)).filter(|_| own.is_empty()) else {
+                    return own;
+                };
+                // No text of its own: a scan, perhaps, to be read.
+                let read = crate::pdftext::extract_with(drawn, &mut |scan| match scan {
+                    crate::ocr::Scan::Reading => {
+                        let _ = req.reply.send_blocking(SearchReply::Reading(page));
+                    }
+                    crate::ocr::Scan::Unreadable => unreadable.store(true, Ordering::Relaxed),
+                });
+                normalize(&read.text(0, read.chars.len()))
             });
             if text.contains(&req.query) {
-                let _ = req.reply.send_blocking(Some(page));
+                let _ = req.reply.send_blocking(SearchReply::Done(Some(page)));
                 continue 'requests;
             }
         }
-        let _ = req.reply.send_blocking(None);
+        let _ = req.reply.send_blocking(SearchReply::Done(None));
     }
 }
 
@@ -723,6 +791,44 @@ mod tests {
         assert!(page.contains(&normalize("Self-Organizing Maps")));
         assert!(page.contains(&normalize("distance is defined")));
         assert_eq!(normalize("Abu‑Mostafa’s “hints”"), "abu-mostafa's\"hints\"");
+    }
+
+    /// Search reads a scan's words off it, and says which page it is
+    /// reading while it does.
+    #[test]
+    fn search_finds_words_on_a_scan() {
+        if !crate::ocr::tests::have_models() {
+            return;
+        }
+        let scan = crate::ocr::tests::scanned("Scanned receipts are\n\nsearchable now\n");
+        let searcher = Searcher::spawn(Arc::new(scan), 1);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let h = heard.clone();
+        searcher.on_reading(move |page| h.borrow_mut().push(page));
+        let find = |q: &str| gtk4::glib::MainContext::new().block_on(searcher.find(q, 0, false));
+        assert_eq!(find("SEARCHABLE now"), Some(0));
+        assert_eq!(*heard.borrow(), [Some(0), None]);
+        // The page is read once.
+        assert_eq!(find("receipts"), Some(0));
+        assert_eq!(find("nowhere"), None);
+        assert_eq!(*heard.borrow(), [Some(0), None, None, None]);
+        assert!(!searcher.met_unreadable_scan());
+    }
+
+    /// With nothing to read scans with, a search through one says so rather
+    /// than just finding nothing.
+    #[test]
+    fn a_scan_without_text_recognition_says_so() {
+        if crate::ocr::model_dir().is_some() {
+            return; // reading scans is tested above
+        }
+        use tiff::encoder::{TiffEncoder, colortype};
+        let mut scan = std::io::Cursor::new(Vec::new());
+        TiffEncoder::new(&mut scan).unwrap().write_image::<colortype::Gray8>(300, 400, &[220u8; 300 * 400]).unwrap();
+        let pdf = crate::tiffpdf::to_pdf(&scan.into_inner()).unwrap();
+        let searcher = Searcher::spawn(Arc::new(pdf), 1);
+        assert_eq!(gtk4::glib::MainContext::new().block_on(searcher.find("words", 0, false)), None);
+        assert!(searcher.met_unreadable_scan());
     }
 
     /// An ordinary page at an ordinary zoom is one texture, exactly as it

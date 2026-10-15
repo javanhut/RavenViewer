@@ -12,6 +12,7 @@ mod emf;
 mod fonts;
 mod history;
 mod look;
+mod ocr;
 mod omml;
 mod pagetiles;
 mod pdf;
@@ -20,6 +21,7 @@ mod pdftext;
 mod render;
 mod pdfview;
 mod theme;
+mod tiffpdf;
 mod window;
 
 use gtk4::{gio, glib};

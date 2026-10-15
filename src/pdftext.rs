@@ -4,6 +4,9 @@
 //! and highlighting need. lopdf's text extraction has the words but not where
 //! they are.
 //!
+//! A scan has no glyphs to collect; its text is read off the page instead
+//! (see `ocr`) and comes back in the same shape.
+//!
 //! Boxes are kept twice: as fractions of the page as displayed (top-left
 //! origin, rotation applied), which is what the view hit-tests and draws in,
 //! and in PDF user space, which is what an annotation's QuadPoints are in.
@@ -61,6 +64,11 @@ pub struct PageText {
 }
 
 pub fn extract(page: &Page<'_>) -> PageText {
+    extract_with(page, &mut |_| {})
+}
+
+/// `extract`, telling `told` when the page is a scan that keeps it waiting.
+pub fn extract_with(page: &Page<'_>, told: &mut dyn FnMut(crate::ocr::Scan)) -> PageText {
     let cache = InterpreterCache::new();
     let settings = InterpreterSettings { render_annotations: false, ..Default::default() };
     // Interpreting in user space keeps the boxes in the coordinates an
@@ -68,8 +76,13 @@ pub fn extract(page: &Page<'_>) -> PageText {
     let crop = page.intersected_crop_box();
     let bbox = Rect::new(crop.x0, crop.y0, crop.x1, crop.y1);
     let mut context = Context::new(Affine::IDENTITY, bbox, &cache, page.xref(), settings);
-    let mut device = Collector { chars: Vec::new() };
+    let mut device = Collector { chars: Vec::new(), pictures: Default::default() };
     interpret_page(page, &mut context, &mut device);
+    if device.chars.is_empty()
+        && let Some(read) = crate::ocr::read(page, &device.pictures, told)
+    {
+        device.chars = read.as_ref().clone();
+    }
 
     let display = page.initial_transform(true).to_kurbo();
     let (width, height) = page.render_dimensions();
@@ -100,6 +113,8 @@ pub fn extract(page: &Page<'_>) -> PageText {
 struct Collector {
     /// Text, box and the direction of its advance, all in user space.
     chars: Vec<(String, Rect, hayro::vello_cpu::kurbo::Vec2)>,
+    /// What it draws instead of text, should there be none.
+    pictures: crate::ocr::Pictures,
 }
 
 impl<'a> Device<'a> for Collector {
@@ -108,7 +123,9 @@ impl<'a> Device<'a> for Collector {
     fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'a>, _: &PathDrawMode) {}
     fn push_clip_path(&mut self, _: &ClipPath) {}
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
-    fn draw_image(&mut self, _: Image<'a, '_>, _: Affine) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, transform: Affine) {
+        self.pictures.add(&image, transform);
+    }
     fn pop_clip_path(&mut self) {}
     fn pop_transparency_group(&mut self) {}
 
@@ -367,9 +384,15 @@ struct Request {
     reply: async_channel::Sender<Arc<PageText>>,
 }
 
+/// Asks for pages scrolled past that are still waiting when this many newer
+/// ones have come in are let go; a page coming back on screen asks again.
+const WAITING: usize = 16;
+
 /// Text layout on its own thread: interpreting a page costs about what
 /// drawing it does, and must not stall scrolling. Pages are asked for one at
-/// a time as they come on screen.
+/// a time as they come on screen, the newest ask first: reading a scan takes
+/// a second or two a page, and the page on screen now matters more than the
+/// ones scrolled past on the way to it.
 pub struct TextLayer {
     tx: mpsc::Sender<Request>,
 }
@@ -380,11 +403,23 @@ impl TextLayer {
         let _ = std::thread::Builder::new().name("raven-text".into()).spawn(move || {
             let Ok(pdf) = Pdf::new(bytes) else { return };
             let pages = pdf.pages();
-            while let Ok(req) = rx.recv() {
-                let text = pages.get(req.page).map(extract).unwrap_or_default();
-                if req.reply.send_blocking(Arc::new(text)).is_err() {
-                    continue; // the asker went away; keep serving the rest
+            let mut waiting: Vec<Request> = Vec::new();
+            loop {
+                if waiting.is_empty() {
+                    match rx.recv() {
+                        Ok(req) => waiting.push(req),
+                        Err(_) => return,
+                    }
                 }
+                waiting.extend(rx.try_iter());
+                // Letting a request go closes its reply: the asker hears nothing.
+                waiting.drain(..waiting.len().saturating_sub(WAITING));
+                let Some(req) = waiting.pop() else { continue };
+                if req.reply.is_closed() {
+                    continue; // the asker went away
+                }
+                let text = pages.get(req.page).map(extract).unwrap_or_default();
+                let _ = req.reply.send_blocking(Arc::new(text));
             }
         });
         Self { tx }

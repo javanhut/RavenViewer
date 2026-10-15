@@ -37,9 +37,15 @@ run = [
   "cargo test --locked",
 ]
 
+[commands.ocr-models]
+desc = "Fetch the text recognition models for scans into data/ocr (about 12 MB, once)"
+run = [
+  "sh -c 'mkdir -p data/ocr && for m in text-detection text-recognition; do [ -f data/ocr/$m.rten ] || { curl -fL --retry 3 -o data/ocr/$m.rten.part https://ocrs-models.s3-accelerate.amazonaws.com/$m.rten && mv data/ocr/$m.rten.part data/ocr/$m.rten; } || exit 1; done'",
+]
+
 [commands.install]
-desc = "Install raven-viewer, its desktop entry and file associations"
-dep = ["build"]
+desc = "Install raven-viewer, its desktop entry, file associations and text recognition models"
+dep = ["build", "ocr-models"]
 escalate = true
 writes = ["{{bindir}}", "{{datadir}}", "{{icondir}}"]
 run = [
@@ -47,6 +53,7 @@ run = [
   "install -Dm644 data/{{app_id}}.desktop {{datadir}}/applications/{{app_id}}.desktop",
   "install -Dm644 data/{{app_id}}.metainfo.xml {{datadir}}/metainfo/{{app_id}}.metainfo.xml",
   "install -Dm644 data/icons/hicolor/scalable/apps/{{app_id}}.svg {{icondir}}/{{app_id}}.svg",
+  "install -Dm644 -t {{datadir}}/raven-viewer/ocr data/ocr/text-detection.rten data/ocr/text-recognition.rten",
   "sh -c 'command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q {{datadir}}/applications || true'",
   "sh -c 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf {{datadir}}/icons/hicolor || true'",
 ]
@@ -64,6 +71,7 @@ run = [
   "rm -f {{datadir}}/applications/{{app_id}}.desktop",
   "rm -f {{datadir}}/metainfo/{{app_id}}.metainfo.xml",
   "rm -f {{icondir}}/{{app_id}}.svg",
+  "rm -rf {{datadir}}/raven-viewer",
 ]
 
 [commands.clean]

@@ -138,6 +138,24 @@ pub fn combine(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     if files.len() < 2 {
         bail!("choose at least two files");
     }
+    // A scanned TIFF goes in as the PDF of its pages.
+    let tiffs: Vec<(String, Vec<u8>)>;
+    let files = if files.iter().any(|(_, b)| crate::tiffpdf::is_tiff(b)) {
+        tiffs = files
+            .iter()
+            .map(|(name, b)| {
+                let bytes = if crate::tiffpdf::is_tiff(b) {
+                    crate::tiffpdf::to_pdf(b).map_err(|e| anyhow::anyhow!("{name}: {e}"))?
+                } else {
+                    b.clone()
+                };
+                Ok((name.clone(), bytes))
+            })
+            .collect::<Result<_>>()?;
+        &tiffs[..]
+    } else {
+        files
+    };
     let formats: Vec<Format> = files
         .iter()
         .map(|(name, b)| Format::sniff(b).map_err(|e| anyhow::anyhow!("{name}: {e}")))
@@ -199,5 +217,22 @@ mod tests {
         let docs = combine(&[("a.txt".into(), b"one\n".to_vec()), ("b.txt".into(), b"two\n".to_vec())]).unwrap();
         let text = String::from_utf8(convert(&docs, Format::Text, "x").unwrap()).unwrap();
         assert!(text.contains("one") && text.contains("two"), "{text}");
+    }
+
+    /// A scan goes in as its pages, with a document or a PDF.
+    #[test]
+    fn a_tiff_combines_as_its_pages() {
+        use tiff::encoder::{TiffEncoder, colortype};
+        let mut scan = std::io::Cursor::new(Vec::new());
+        let mut tiff = TiffEncoder::new(&mut scan).unwrap();
+        for _ in 0..2 {
+            tiff.write_image::<colortype::Gray8>(40, 60, &[200u8; 40 * 60]).unwrap();
+        }
+        let scan = scan.into_inner();
+        let merged = combine(&[("scan.tif".into(), scan.clone()), ("notes.txt".into(), b"words\n".to_vec())]).unwrap();
+        assert_eq!(pdf_pages(merged).unwrap(), 3);
+        let pdf = convert(b"one\n", Format::Pdf, "one").unwrap();
+        let merged = combine(&[("a.pdf".into(), pdf), ("scan.tif".into(), scan)]).unwrap();
+        assert_eq!(pdf_pages(merged).unwrap(), 3);
     }
 }

@@ -135,6 +135,9 @@ struct Tab {
     page_total: gtk::Label,
     search_bar: gtk::SearchBar,
     search: gtk::SearchEntry,
+    /// Beside the search box while a search reads a scanned page.
+    search_reading: gtk::Box,
+    search_reading_label: gtk::Label,
     selection_tools: gtk::Popover,
     context_menu: gtk::PopoverMenu,
     /// Where the context menu was opened, for the actions it offers.
@@ -702,7 +705,7 @@ impl Window {
             || ((has_outline || has_notes) && self.0.config.borrow().show_sidebar);
         self.1.split.set_show_sidebar(show);
 
-        let search = Rc::new(pdf::Searcher::spawn(bytes.clone(), view.page_count()));
+        let search = self.searcher(bytes.clone(), view.page_count());
         let edits = Rc::new(PdfEdits {
             editor: pdfedit::Editor::spawn(bytes.clone()),
             bytes: RefCell::new(bytes.clone()),
@@ -973,6 +976,19 @@ impl Window {
 
     // ── Search ──────────────────────────────────────────────────────────
 
+    /// A search of `bytes` that shows which scanned page it is reading.
+    fn searcher(&self, bytes: Arc<Vec<u8>>, pages: usize) -> Rc<pdf::Searcher> {
+        let searcher = pdf::Searcher::spawn(bytes, pages);
+        let (reading, label) = (self.1.search_reading.clone(), self.1.search_reading_label.clone());
+        searcher.on_reading(move |page| {
+            if let Some(page) = page {
+                label.set_label(&format!("Reading the scan, page {} of {pages}…", page + 1));
+            }
+            reading.set_visible(page.is_some());
+        });
+        Rc::new(searcher)
+    }
+
     fn find_next(&self, backwards: bool) {
         let query = self.1.search.text().trim().to_string();
         if query.is_empty() {
@@ -988,6 +1004,9 @@ impl Window {
             match view.find_next(&search, backwards).await {
                 Found::Match | Found::Stale => {}
                 Found::OnlyMatch => this.toast("This is the only match"),
+                Found::Nothing if search.met_unreadable_scan() => this.toast(&format!(
+                    "No matches for “{query}”. Scanned pages can’t be searched until text recognition is installed (make ocr-models)"
+                )),
                 Found::Nothing => this.toast(&format!("No matches for “{query}”")),
             }
         });
@@ -1075,7 +1094,7 @@ impl Window {
         };
         if let Some(Doc::Pdf { view: v, search, .. }) = self.1.doc.borrow_mut().as_mut() {
             *v = view.clone();
-            *search = Rc::new(pdf::Searcher::spawn(bytes, view.page_count()));
+            *search = self.searcher(bytes, view.page_count());
         }
         self.after_pdf_changed(&view);
     }
@@ -1444,7 +1463,9 @@ impl Window {
     fn save(&self, then: Option<Box<dyn FnOnce()>>) {
         let (path, saved_as) = match self.1.doc.borrow().as_ref() {
             Some(Doc::Docx { path, saved_as, .. }) => (path.clone(), *saved_as),
-            Some(Doc::Pdf { path, .. }) => (path.clone(), Some(Format::Pdf)),
+            // A PDF that was opened from a TIFF is saved as a PDF beside it,
+            // never written over the scan.
+            Some(Doc::Pdf { path, .. }) => (path.clone(), (Format::of(path) == Format::Pdf).then_some(Format::Pdf)),
             None => return,
         };
         match saved_as {
@@ -1754,7 +1775,9 @@ impl Window {
     }
 
     fn combine(&self, files: Vec<PathBuf>) {
-        let formats: Vec<Format> = files.iter().map(|p| Format::of(p)).collect();
+        // A TIFF is combined as the PDF of its pages.
+        let formats: Vec<Format> =
+            files.iter().map(|p| if crate::tiffpdf::is_tiff_name(p) { Format::Pdf } else { Format::of(p) }).collect();
         let out_format = convert::combined_format(&formats);
         let open_name = self.1.doc.borrow().as_ref().map(|d| d.path().to_path_buf());
         // The open document is combined as it is on screen, edits included.
@@ -2554,7 +2577,14 @@ impl Tab {
     fn new() -> Tab {
         // ── Search ──────────────────────────────────────────────────────
         let search = gtk::SearchEntry::builder().placeholder_text("Find in document").width_request(320).build();
-        let search_bar = gtk::SearchBar::builder().child(&search).show_close_button(true).build();
+        let search_reading_label =
+            gtk::Label::builder().css_classes(["dim-label"]).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let search_reading = gtk::Box::builder().spacing(8).margin_start(12).visible(false).build();
+        search_reading.append(&adw::Spinner::new());
+        search_reading.append(&search_reading_label);
+        // The box stays put in the middle while the note comes and goes.
+        let search_row = gtk::CenterBox::builder().center_widget(&search).end_widget(&search_reading).build();
+        let search_bar = gtk::SearchBar::builder().child(&search_row).show_close_button(true).build();
         search_bar.connect_entry(&search);
 
         // ── Sidebar ─────────────────────────────────────────────────────
@@ -2671,6 +2701,8 @@ impl Tab {
             page_total,
             search_bar,
             search,
+            search_reading,
+            search_reading_label,
             selection_tools,
             context_menu,
             context_spot: Cell::new(None),
@@ -2762,10 +2794,10 @@ pub const MIME_TYPES: [&str; 3] =
 fn document_filters() -> gio::ListStore {
     let filter = gtk::FileFilter::new();
     filter.set_name(Some("Documents"));
-    for mime in MIME_TYPES.iter().chain(&["text/plain", "text/markdown"]) {
+    for mime in MIME_TYPES.iter().chain(&["text/plain", "text/markdown", "image/tiff"]) {
         filter.add_mime_type(mime);
     }
-    for suffix in ["pdf", "docx", "doc", "txt", "md"] {
+    for suffix in ["pdf", "docx", "doc", "txt", "md", "tif", "tiff"] {
         filter.add_suffix(suffix);
     }
     let all = gtk::FileFilter::new();
@@ -2808,9 +2840,11 @@ enum Loaded {
     Docx(Box<docx::Docx>, Format),
 }
 
-/// Sniff the bytes, not the extension: a PDF saved as .bin still opens.
+/// Sniff the bytes, not the extension: a PDF saved as .bin still opens. A
+/// scanned TIFF opens as the PDF of its pages.
 fn load(path: &Path) -> anyhow::Result<Loaded> {
     let bytes = std::fs::read(path)?;
+    let bytes = if crate::tiffpdf::is_tiff(&bytes) { crate::tiffpdf::to_pdf(&bytes)? } else { bytes };
     if Format::sniff(&bytes)? == Format::Pdf {
         let bytes = Arc::new(bytes);
         let info = pdf::load_info(&bytes)?;
@@ -3392,6 +3426,148 @@ mod drive {
             w.1.search_bar.set_search_mode(false);
             settle(300);
             assert_eq!(view.search_position(), None);
+        });
+    }
+
+    /// TIFFs open as pages: `GDK_BACKEND=broadway XDG_CONFIG_HOME=… RAVEN_DRIVE_DIR=…
+    /// RAVEN_DRIVE_TIFFS="a.tif:b.tif" cargo test drive_tiff -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn drive_tiff() {
+        crate::gtk_test::run(|| {
+            adw::init().unwrap();
+            crate::theme::apply();
+            let app = adw::Application::builder()
+                .application_id("com.ravenviewer.RavenDriveTiff")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            let w = Window::new(&app);
+            w.1.content.set_transition_type(gtk::StackTransitionType::None);
+            w.0.window.set_default_size(1100, 800);
+            w.present();
+            pump(300);
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"continuous".to_variant()));
+            for (i, path) in std::env::var("RAVEN_DRIVE_TIFFS").unwrap().split(':').enumerate() {
+                w.open(gio::File::for_path(path));
+                pump(2500);
+                let (view, _) = w.active().pdf().expect("a TIFF opens as pages");
+                let expected = crate::tiffpdf::to_pdf(&std::fs::read(path).unwrap()).unwrap();
+                let pages = pdf::load_info(&Arc::new(expected)).unwrap().page_sizes.len();
+                assert_eq!(view.page_count(), pages);
+                assert!(!w.active().dirty(), "nothing to save yet");
+                eprintln!("{path}: {pages} pages, title {:?}", w.0.window.title());
+                shot(&w, &format!("tiff-{i}"));
+            }
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"double".to_variant()));
+            pump(700);
+            shot(&w, "tiff-double");
+            shot(&w, "tiff-double");
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"continuous".to_variant()));
+        });
+    }
+
+    /// A scanned TIFF (`RAVEN_DRIVE_SCAN`) is searched for words
+    /// (`RAVEN_DRIVE_QUERY`) found only on its last page, and its text is
+    /// selected and copied.
+    #[test]
+    #[ignore]
+    fn drive_ocr() {
+        crate::gtk_test::run(|| {
+            adw::init().unwrap();
+            crate::theme::apply();
+            let app = adw::Application::builder()
+                .application_id("com.ravenviewer.RavenDriveOcr")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            let w = Window::new(&app);
+            w.1.content.set_transition_type(gtk::StackTransitionType::None);
+            w.0.window.set_default_size(1100, 800);
+            w.present();
+            pump(300);
+            let _ = WidgetExt::activate_action(&w.0.window, "win.page-layout", Some(&"continuous".to_variant()));
+            w.open(gio::File::for_path(std::env::var("RAVEN_DRIVE_SCAN").unwrap()));
+            let settle = |ms: u64| {
+                for _ in 0..ms / 35 {
+                    w.0.window.queue_draw();
+                    pump(35);
+                }
+            };
+            let started = std::time::Instant::now();
+            while w.active().pdf().is_none() && started.elapsed().as_secs() < 30 {
+                settle(100);
+            }
+            eprintln!("opened in {:?}", started.elapsed());
+            settle(500);
+            let (view, _) = w.active().pdf().unwrap();
+            let pages = view.page_count();
+
+            // The page on screen is read without being asked.
+            let started = std::time::Instant::now();
+            let mut text = None;
+            while started.elapsed().as_secs() < 30 && text.is_none() {
+                let _ = WidgetExt::activate_action(&w.0.window, "win.select-page", None);
+                settle(250);
+                text = view.selected_text().filter(|t| !t.is_empty());
+            }
+            let text = text.expect("the scan on screen was never read");
+            eprintln!("page 1 read in {:?}: {:?}…", started.elapsed(), text.chars().take(120).collect::<String>());
+            let _ = WidgetExt::activate_action(&w.0.window, "win.copy", None);
+            pump(200);
+            let copied = glib::MainContext::default().block_on(w.0.window.clipboard().read_text_future()).ok().flatten();
+            assert_eq!(copied.as_deref(), Some(text.as_str()), "the scan's words copy");
+            shot(&w, "ocr-1-selected");
+            view.clear_selection();
+
+            // Search goes off to the pages not read yet, saying so.
+            let query = std::env::var("RAVEN_DRIVE_QUERY").unwrap();
+            let _ = WidgetExt::activate_action(&w.0.window, "win.find", None);
+            w.1.search.set_text(&query);
+            settle(300);
+            w.1.search.emit_activate();
+            let started = std::time::Instant::now();
+            let mut said = Vec::new();
+            while started.elapsed().as_secs() < 60 && view.search_position().flatten().is_none() {
+                settle(100);
+                if w.1.search_reading.is_visible() {
+                    let label = w.1.search_reading_label.label().to_string();
+                    if said.last() != Some(&label) {
+                        // The second page read: the bar has finished sliding
+                        // in by then. Broadway lays it out only for a capture.
+                        if said.len() == 1 {
+                            shot(&w, "ocr-2-reading");
+                            shot(&w, "ocr-2-reading");
+                        }
+                        said.push(label);
+                    }
+                }
+            }
+            let at = view.search_position().flatten().expect("the words were found");
+            eprintln!("found on page {} match {:?} in {:?}; said {said:?}", at.0 + 1, at.1, started.elapsed());
+            assert_eq!(at.0, pages - 1, "the words are on the last page");
+            assert!(at.1.is_some(), "and marked there");
+            assert!(!said.is_empty(), "reading was shown");
+            settle(300);
+            assert!(!w.1.search_reading.is_visible(), "and put away once done");
+            shot(&w, "ocr-3-found");
+            shot(&w, "ocr-3-found");
+            // How the note sits beside the box, held still for a look.
+            w.1.search_reading_label.set_label("Reading the scan, page 3 of 3…");
+            w.1.search_reading.set_visible(true);
+            shot(&w, "ocr-4-note");
+            shot(&w, "ocr-4-note");
+            w.1.search_reading.set_visible(false);
+
+            // Found again at once: the pages are read.
+            w.1.search.emit_activate();
+            settle(300);
+            w.1.search.emit_activate();
+            let started = std::time::Instant::now();
+            while started.elapsed().as_secs() < 5 && view.search_position().flatten().is_none_or(|p| p.0 != pages - 1) {
+                settle(50);
+            }
+            eprintln!("round again in {:?}", started.elapsed());
         });
     }
 
